@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.idea/
+artifacts/
+tb_logs/
+tmp_pdf_extracts/
+tmp_pdf_figures/
+reference/
+origin_rl_project/
+.claude/
