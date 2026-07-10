@@ -122,31 +122,39 @@ def make_training_dashboard_callback(
                 terms = info.get("terms") or {}
                 cfg = info.get("config")
                 if cfg is not None and terms:
-                    self._append_rollout_value("reward_flux_component", cfg.w_flux * terms["flux"])
-                    self._append_rollout_value(
-                        "reward_uniformity_goal_component",
-                        cfg.w_uniformity_goal
-                        * terms.get("uniformity_excess", terms["uniformity_improvement"]),
-                    )
-                    self._append_rollout_value(
-                        "reward_uniformity_penalty",
-                        -cfg.w_uniformity * terms.get("moisture_cv_gap", terms["moisture_cv"]),
-                    )
-                    self._append_rollout_value(
-                        "reward_energy_penalty",
-                        -cfg.w_energy * terms["energy"],
-                    )
-                    self._append_rollout_value(
-                        "reward_ph_penalty",
-                        # What is actually subtracted from reward (stock vs
-                        # acid-increment); falls back to stock for old envs.
-                        -cfg.w_ph * terms.get("ph_penalty_charge", terms["ph_violation"]),
-                    )
-                    self._append_rollout_value(
-                        "reward_local_dry_penalty",
-                        -cfg.w_local_dry
-                        * terms.get("local_dry_violation", terms["anode_dry_violation"]),
-                    )
+                    if "reward_u" in terms:
+                        # v5.0 reward: per-step exam instalments, read directly.
+                        self._append_rollout_value("reward_uniformity_component", terms["reward_u"])
+                        self._append_rollout_value("reward_ph_component", terms["reward_ph"])
+                        self._append_rollout_value("reward_energy_component", terms["reward_e"])
+                        self._append_rollout_value("step_quality_mean", terms["step_quality"])
+                        self._append_rollout_value("raw_power_phys", terms["power_phys"])
+                        self._append_rollout_value("raw_ph_violation_mixed", terms["ph_violation_mixed"])
+                    else:
+                        # Legacy (pre-v5.0) weighted-penalty reward structure.
+                        self._append_rollout_value("reward_flux_component", cfg.w_flux * terms["flux"])
+                        self._append_rollout_value(
+                            "reward_uniformity_goal_component",
+                            cfg.w_uniformity_goal
+                            * terms.get("uniformity_excess", terms["uniformity_improvement"]),
+                        )
+                        self._append_rollout_value(
+                            "reward_uniformity_penalty",
+                            -cfg.w_uniformity * terms.get("moisture_cv_gap", terms["moisture_cv"]),
+                        )
+                        self._append_rollout_value(
+                            "reward_energy_penalty",
+                            -cfg.w_energy * terms["energy"],
+                        )
+                        self._append_rollout_value(
+                            "reward_ph_penalty",
+                            -cfg.w_ph * terms.get("ph_penalty_charge", terms["ph_violation"]),
+                        )
+                        self._append_rollout_value(
+                            "reward_local_dry_penalty",
+                            -cfg.w_local_dry
+                            * terms.get("local_dry_violation", terms["anode_dry_violation"]),
+                        )
                     self._append_rollout_value("raw_flux", terms["flux"])
                     self._append_rollout_value("raw_energy", terms["energy"])
                     self._append_rollout_value("raw_ph_violation", terms["ph_violation"])
@@ -212,6 +220,24 @@ def make_training_dashboard_callback(
             if kl_to_bc is not None and np.isfinite(kl_to_bc):
                 metrics["kl_to_bc"] = float(kl_to_bc)
 
+            # Curriculum state published by the curriculum callback (v27).
+            difficulty = getattr(self.model, "curriculum_difficulty_current", None)
+            if difficulty is not None:
+                metrics["curriculum_difficulty"] = float(difficulty)
+            rolling = getattr(self.model, "curriculum_rolling_success", None)
+            if rolling is not None:
+                metrics["curriculum_rolling_success"] = float(rolling)
+
+            # Exploration-noise level (v28): the actual log_std and, when the
+            # anneal callback is active, its descending cap.
+            if hasattr(self.model.policy, "log_std"):
+                metrics["log_std_mean"] = float(
+                    self.model.policy.log_std.detach().mean().item()
+                )
+            log_std_cap = getattr(self.model, "log_std_cap_current", None)
+            if log_std_cap is not None:
+                metrics["log_std_cap"] = float(log_std_cap)
+
             for key, values in sorted(self.rollout_values.items()):
                 if values:
                     metrics[key] = float(sum(values) / len(values))
@@ -223,6 +249,12 @@ def make_training_dashboard_callback(
                     f.write(json.dumps(metrics, sort_keys=True) + "\n")
 
             tensorboard_groups = {
+                "reward_terms/uniformity_component": "reward_uniformity_component",
+                "reward_terms/ph_component": "reward_ph_component",
+                "reward_terms/energy_component": "reward_energy_component",
+                "environment/step_quality": "step_quality_mean",
+                "environment/power_phys": "raw_power_phys",
+                "environment/ph_violation_mixed": "raw_ph_violation_mixed",
                 "reward_terms/flux_component": "reward_flux_component",
                 "reward_terms/uniformity_goal_component": "reward_uniformity_goal_component",
                 "reward_terms/uniformity_penalty": "reward_uniformity_penalty",
@@ -243,6 +275,10 @@ def make_training_dashboard_callback(
                 "critic/explained_variance_rollout": "explained_variance",
                 "policy/entropy": "policy_entropy",
                 "policy/kl_to_bc": "kl_to_bc",
+                "policy/log_std_mean": "log_std_mean",
+                "policy/log_std_cap": "log_std_cap",
+                "curriculum/difficulty": "curriculum_difficulty",
+                "curriculum/rolling_success": "curriculum_rolling_success",
             }
             for tensorboard_key, metric_key in tensorboard_groups.items():
                 if metric_key in metrics:
@@ -252,6 +288,9 @@ def make_training_dashboard_callback(
                 logger = task.get_logger()
                 clearml_groups = {
                     "Reward Components": [
+                        "reward_uniformity_component",
+                        "reward_ph_component",
+                        "reward_energy_component",
                         "reward_flux_component",
                         "reward_uniformity_goal_component",
                         "reward_uniformity_penalty",
@@ -264,6 +303,9 @@ def make_training_dashboard_callback(
                         "outcome_mean_moisture",
                         "outcome_mean_ph",
                         "raw_ph_violation",
+                        "raw_ph_violation_mixed",
+                        "raw_power_phys",
+                        "step_quality_mean",
                         "raw_local_dry_violation",
                         "raw_moisture_cv",
                     ],
@@ -274,7 +316,8 @@ def make_training_dashboard_callback(
                         "action_delta_mean",
                     ],
                     "Critic Diagnostics": ["explained_variance"],
-                    "Policy Diagnostics": ["policy_entropy", "kl_to_bc"],
+                    "Policy Diagnostics": ["policy_entropy", "kl_to_bc", "log_std_mean", "log_std_cap"],
+                    "Curriculum": ["curriculum_difficulty", "curriculum_rolling_success"],
                     "Training Outcome": ["episode_reward", "episode_length"],
                 }
                 for title, keys in clearml_groups.items():
@@ -782,6 +825,166 @@ def make_best_checkpoint_callback(
     return BestCheckpointCallback()
 
 
+def make_curriculum_callback(
+    *,
+    threshold: float,
+    window: int,
+    step: float,
+    start: float = 0.0,
+    task=None,
+):
+    """Adaptive curriculum (v27): raise difficulty when the policy earns it.
+
+    Counts end-of-episode success (uniform AT the final step — reach AND hold,
+    stricter than merely touching the target) over a rolling window. When the
+    rolling rate clears ``threshold`` with a full window at the current level,
+    difficulty rises by ``step`` and is broadcast to every parallel worker via
+    VecEnv.env_method; the window resets so each level is judged on its own
+    episodes. If the policy never clears the bar, difficulty simply stays put —
+    a run stuck at level 0 is itself the diagnosis (cannot learn the easiest
+    task from scratch).
+    """
+
+    from stable_baselines3.common.callbacks import BaseCallback
+
+    class CurriculumCallback(BaseCallback):
+        def __init__(self) -> None:
+            super().__init__()
+            self.difficulty = float(start)
+            self.successes: deque = deque(maxlen=window)
+            self.episodes_at_level = 0
+            self.advance_history: list[dict[str, float]] = []
+
+        def _publish(self) -> None:
+            # Read by the dashboard callback at rollout end (same pattern as
+            # last_kl_to_bc) so difficulty lands in the jsonl/ClearML curves.
+            self.model.curriculum_difficulty_current = float(self.difficulty)
+            if self.successes:
+                self.model.curriculum_rolling_success = float(
+                    sum(self.successes) / len(self.successes)
+                )
+
+        def _on_training_start(self) -> None:
+            self._publish()
+
+        def _on_step(self) -> bool:
+            for info in self.locals.get("infos", []):
+                if info.get("episode") is None:
+                    continue
+                self.successes.append(1.0 if info.get("success") else 0.0)
+                self.episodes_at_level += 1
+            if (
+                self.difficulty < 1.0
+                and self.episodes_at_level >= window
+                and len(self.successes) == window
+            ):
+                rate = float(sum(self.successes) / len(self.successes))
+                if rate >= threshold:
+                    self.difficulty = float(min(1.0, self.difficulty + step))
+                    self.training_env.env_method(
+                        "set_curriculum_difficulty", self.difficulty
+                    )
+                    self.advance_history.append(
+                        {
+                            "step": float(self.num_timesteps),
+                            "difficulty": self.difficulty,
+                            "success_rate": rate,
+                        }
+                    )
+                    print(
+                        f"[curriculum] step={self.num_timesteps} difficulty -> "
+                        f"{self.difficulty:.2f} (rolling succ {rate:.2f} over {window} eps)"
+                    )
+                    if task is not None:
+                        task.get_logger().report_scalar(
+                            title="Curriculum",
+                            series="difficulty",
+                            value=self.difficulty,
+                            iteration=int(self.num_timesteps),
+                        )
+                    self.successes.clear()
+                    self.episodes_at_level = 0
+            self._publish()
+            return True
+
+    return CurriculumCallback()
+
+
+def make_log_std_anneal_callback(
+    *,
+    anneal_to: float,
+    anneal_steps: int,
+    curriculum_cb=None,
+):
+    """v28: shrink the exploration noise once the curriculum tops out.
+
+    v27 showed the structural conflict of from-scratch training: launching
+    needs big noise (sigma = 1.0 was what let random pushes stumble into the
+    wage and start learning), but PPO shrinks log_std extremely slowly on its
+    own (17 -> 11.7 entropy over 3M steps, sigma still 0.64), so the policy
+    keeps optimising for its noise-injected self — saturated means, and the
+    deterministic exam policy turns into full-voltage bombardment (energy
+    42 -> 79, exam decaying while training success stays 0.9+).
+
+    Mechanics: once ``curriculum_cb.difficulty`` reaches 1.0 (or immediately,
+    if no curriculum callback is given), a per-step CAP on log_std descends
+    linearly from the policy's current max to ``anneal_to`` over
+    ``anneal_steps`` steps: ``log_std.data.clamp_(max=cap)``. A cap, not an
+    assignment — PPO may shrink noise faster than the schedule, it just
+    cannot stay above it. -2.7 (sigma ~ 6.7% half-range ~ 1.3 V) is the
+    fine-operation noise level validated by v24/v25.
+    """
+
+    if anneal_steps <= 0:
+        return None
+
+    import torch as th
+    from stable_baselines3.common.callbacks import BaseCallback
+
+    class LogStdAnnealCallback(BaseCallback):
+        def __init__(self) -> None:
+            super().__init__()
+            self.start_step: int | None = None
+            self.anneal_from = 0.0
+            self.completed = False
+
+        def _apply(self) -> None:
+            if self.start_step is None:
+                if curriculum_cb is not None and curriculum_cb.difficulty < 1.0:
+                    return
+                self.start_step = int(self.num_timesteps)
+                self.anneal_from = float(self.model.policy.log_std.detach().max().item())
+                print(
+                    f"[anneal] step={self.num_timesteps} noise annealing armed: "
+                    f"log_std cap {self.anneal_from:.2f} -> {anneal_to:g} "
+                    f"over {anneal_steps} steps"
+                )
+            progress = min(1.0, (self.num_timesteps - self.start_step) / float(anneal_steps))
+            cap = self.anneal_from + progress * (anneal_to - self.anneal_from)
+            with th.no_grad():
+                self.model.policy.log_std.data.clamp_(max=cap)
+            # Read by the dashboard callback at rollout end.
+            self.model.log_std_cap_current = float(cap)
+            if not self.completed and progress >= 1.0:
+                self.completed = True
+                print(f"[anneal] step={self.num_timesteps} annealing complete: log_std cap = {anneal_to:g}")
+
+        def _on_rollout_start(self) -> None:
+            self._apply()
+
+        def _on_step(self) -> bool:
+            self._apply()
+            return True
+
+        def _on_training_end(self) -> None:
+            # The final train() update can nudge log_std back above the cap
+            # with no rollout following to re-clamp it; the saved model must
+            # honour the schedule.
+            self._apply()
+
+    return LogStdAnnealCallback()
+
+
 def train_ppo(
     make_env: Callable[[int], SoilBoxEnv],
     steps: int,
@@ -1137,6 +1340,22 @@ def base_defaults() -> dict[str, Any]:
         # v25 harvest: every N steps exam the policy on a 20-scenario battery
         # subset and keep the best snapshot. 0 = off.
         "checkpoint_every": 0,
+        # v27 adaptive curriculum (from-scratch PPO): reshape the initial-field
+        # dice from easy to hard; advance when rolling end-of-episode success
+        # over `curriculum_window` episodes clears `curriculum_threshold`.
+        # min_contrast is the easy-end contrast floor — calibrated with
+        # `reward_audit.py --curriculum-audit` so proportional > idle holds at
+        # EVERY difficulty (the diffusion-solves-easy-fields trap).
+        "curriculum": False,
+        "curriculum_threshold": 0.8,
+        "curriculum_window": 200,
+        "curriculum_step": 0.1,
+        "curriculum_min_contrast": 0.6,
+        # v28 exploration-noise annealing: once the curriculum reaches d=1.0
+        # (or from step 0 without curriculum), cap log_std on a linear descent
+        # to `log_std_anneal_to` over `log_std_anneal_steps` steps. 0 = off.
+        "log_std_anneal_to": -2.7,
+        "log_std_anneal_steps": 0,
     }
 
 
@@ -1223,6 +1442,26 @@ def print_run_header(args: argparse.Namespace, cfg) -> None:
         "Best-checkpoint battery: "
         + (f"every {ckpt_every} steps (20-scenario subset)" if ckpt_every > 0 else "off")
     )
+    if bool(getattr(args, "curriculum", False)):
+        print(
+            "Curriculum: ON (adaptive, threshold="
+            f"{getattr(args, 'curriculum_threshold', 0.8):g} over "
+            f"{getattr(args, 'curriculum_window', 200)} eps, step="
+            f"{getattr(args, 'curriculum_step', 0.1):g}, min_contrast="
+            f"{getattr(args, 'curriculum_min_contrast', 0.6):g})"
+        )
+    else:
+        print("Curriculum: off")
+    anneal_steps = int(getattr(args, "log_std_anneal_steps", 0))
+    print(
+        "Noise annealing: "
+        + (
+            f"ON (log_std cap -> {getattr(args, 'log_std_anneal_to', -2.7):g} "
+            f"over {anneal_steps} steps after curriculum tops out)"
+            if anneal_steps > 0
+            else "off"
+        )
+    )
     print(f"Run output directory: {args.run_dir}")
 
 
@@ -1250,6 +1489,9 @@ def run_train_standard(args: argparse.Namespace, cfg, task, tensorboard_log: Pat
     # below always runs on the nominal environment with injected frozen
     # scenarios, so scores stay comparable across experiments.
     bc_on = bool(getattr(args, "bc_pretrain", False))
+    curriculum_on = bool(getattr(args, "curriculum", False))
+    if curriculum_on and not args.randomize_initial_field:
+        raise ValueError("curriculum=True requires randomize_initial_field=True (the curriculum reshapes the initial-field dice).")
     checkpoint_cb = make_best_checkpoint_callback(
         run_dir=args.run_dir,
         cfg=cfg,
@@ -1257,6 +1499,22 @@ def run_train_standard(args: argparse.Namespace, cfg, task, tensorboard_log: Pat
         every_steps=int(getattr(args, "checkpoint_every", 0)),
         task=task,
     )
+    curriculum_cb = None
+    if curriculum_on:
+        curriculum_cb = make_curriculum_callback(
+            threshold=float(getattr(args, "curriculum_threshold", 0.8)),
+            window=int(getattr(args, "curriculum_window", 200)),
+            step=float(getattr(args, "curriculum_step", 0.1)),
+            start=0.0,
+            task=task,
+        )
+    anneal_cb = make_log_std_anneal_callback(
+        anneal_to=float(getattr(args, "log_std_anneal_to", -2.7)),
+        anneal_steps=int(getattr(args, "log_std_anneal_steps", 0)),
+        curriculum_cb=curriculum_cb,
+    )
+    extra_callbacks = [cb for cb in (checkpoint_cb, curriculum_cb, anneal_cb) if cb is not None]
+    curriculum_min_contrast = float(getattr(args, "curriculum_min_contrast", 0.6))
     standard_model = train_ppo(
         lambda env_seed: SoilBoxEnv(
             config=cfg,
@@ -1264,6 +1522,8 @@ def run_train_standard(args: argparse.Namespace, cfg, task, tensorboard_log: Pat
             randomize=args.randomize_physics,
             randomize_noise=args.randomize_obs_noise,
             randomize_initial=args.randomize_initial_field,
+            curriculum_difficulty=0.0 if curriculum_on else None,
+            curriculum_min_contrast=curriculum_min_contrast,
         ),
         args.steps,
         n_envs=args.n_envs,
@@ -1279,7 +1539,7 @@ def run_train_standard(args: argparse.Namespace, cfg, task, tensorboard_log: Pat
         bc_episodes=int(getattr(args, "bc_episodes", 300)),
         bc_epochs=int(getattr(args, "bc_epochs", 20)),
         after_bc=evaluate_bc_anchor if bc_on else None,
-        extra_callbacks=[checkpoint_cb] if checkpoint_cb is not None else None,
+        extra_callbacks=extra_callbacks or None,
     )
     standard_path = args.run_dir / "soilguard_ppo_standard.zip"
     standard_model.save(standard_path)
@@ -1356,6 +1616,18 @@ def run_train_standard(args: argparse.Namespace, cfg, task, tensorboard_log: Pat
         "ppo_best_battery": best_battery,
         "best_checkpoint": best_checkpoint_info,
         "checkpoint_history": checkpoint_cb.history if checkpoint_cb is not None else None,
+        "curriculum_advance_history": curriculum_cb.advance_history if curriculum_cb is not None else None,
+        "curriculum_final_difficulty": curriculum_cb.difficulty if curriculum_cb is not None else None,
+        "log_std_anneal": (
+            {
+                "start_step": anneal_cb.start_step,
+                "completed": anneal_cb.completed,
+                "anneal_to": float(getattr(args, "log_std_anneal_to", -2.7)),
+                "anneal_steps": int(getattr(args, "log_std_anneal_steps", 0)),
+            }
+            if anneal_cb is not None
+            else None
+        ),
         "baseline_idle_battery": idle_result,
         "baseline_rule_battery": rule_result,
         "noise_evaluation": noise_evaluation,

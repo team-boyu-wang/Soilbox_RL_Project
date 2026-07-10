@@ -66,8 +66,16 @@ def test_reset_and_step_contract() -> None:
         "voltage_loss",
         "effective_voltage_ratio",
         "ph_violation",
-        "ph_stock_charge",
-        "ph_penalty_charge",
+        "ph_violation_mean",
+        "ph_violation_mixed",
+        "power_phys",
+        "u_score",
+        "ph_score",
+        "energy_score",
+        "step_quality",
+        "reward_u",
+        "reward_ph",
+        "reward_e",
         "flux",
     } <= set(info["terms"])
     assert 0.0 < info["terms"]["effective_voltage_ratio"] <= 1.0
@@ -257,18 +265,28 @@ def test_hold_bonus_paid_per_step_below_target() -> None:
             break
 
 
-def test_default_hold_bonus_matches_audited_value() -> None:
-    """The default hold bonus is the reward_audit.py-calibrated 3.0 (user
-    moved it from reward_overrides into the config default after v15).
-    Changing it requires re-running the audit 鈥?this pin makes that loud."""
+def test_v5_reward_is_exam_instalment() -> None:
+    """v5.0 pin: with all hooks at their 0 defaults, the per-step reward is
+    EXACTLY (100/max_steps) * step_quality — the construction that makes the
+    undiscounted episode return equal the exam score. Changing any default
+    hook breaks this identity loudly."""
 
-    assert DEFAULT_CONFIG.hold_bonus == 3.0
-    # Idle on the canonical left-wet field still cannot collect a single wage
-    # step (diffusion alone never reaches the target there).
+    assert DEFAULT_CONFIG.hold_bonus == 0.0
+    assert DEFAULT_CONFIG.success_bonus == 0.0
+    assert DEFAULT_CONFIG.w_uniformity_goal == 0.0
+    assert DEFAULT_CONFIG.w_local_dry == 0.0
     env = SoilBoxEnv(seed=8)
     env.reset(seed=8)
-    _, _, _, _, info = env.step(np.zeros(env.action_space.shape, dtype=np.float32))
-    assert info["terms"]["hold_bonus"] == 0.0
+    push = _normalized_volts(env, [15, 15, 15, -15, -15, -15, 0, 0, 0, 0, 0, 0])
+    scale = 100.0 / env.cfg.max_steps
+    for _ in range(10):
+        _, reward, _, _, info = env.step(push)
+        terms = info["terms"]
+        assert abs(reward - scale * terms["step_quality"]) < 1e-9
+        assert abs(
+            terms["reward_u"] + terms["reward_ph"] + terms["reward_e"]
+            - scale * terms["step_quality"]
+        ) < 1e-9
 
 
 def test_bc_pretrain_learns_direction_and_is_off_by_default() -> None:
@@ -305,52 +323,52 @@ def test_bc_pretrain_learns_direction_and_is_off_by_default() -> None:
     assert float(np.mean(action[3:6])) < -0.05  # right electrodes pull
 
 
-def test_ph_stock_mode_is_default_and_charges_stock_exposure() -> None:
-    """Default pH accounting (v13-v19) is unchanged: the charged penalty equals
-    the stock symmetric worst-cell exposure, every step."""
+def test_ph_mixed_violation_is_peak_mean_blend() -> None:
+    """v5.0 pH input: mixed = 0.7 * worst-cell + 0.3 * whole-box mean stock
+    violation (user decision 2026-07-09). Peak guards the hotspot, mean gives
+    dense gradients; the blend must sit between the two."""
 
-    assert DEFAULT_CONFIG.ph_penalty_mode == "stock"
+    assert DEFAULT_CONFIG.ph_peak_weight == 0.7
     env = SoilBoxEnv(seed=2)
     env.reset(seed=2)
     push = _normalized_volts(env, [15, 15, 15, -15, -15, -15, 0, 0, 0, 0, 0, 0])
-    for _ in range(20):
-        _, _, _, _, info = env.step(push)
-        terms = info["terms"]
-        assert terms["ph_penalty_charge"] == terms["ph_violation"]
-
-
-def test_ph_acid_increment_bills_generation_once_not_standing_debt() -> None:
-    """acid_increment mode charges fresh acid plus a small standing-exposure fee."""
-
-    env = SoilBoxEnv(config={"ph_penalty_mode": "acid_increment"}, seed=2)
-    env.reset(seed=2)
-    push = _normalized_volts(env, [15, 15, 15, -15, -15, -15, 0, 0, 0, 0, 0, 0])
-
-    prev_acid_viol = 0.0
-    charges, stock_viols, acid_viols = [], [], []
+    saw_violation = False
     for _ in range(40):
         _, _, _, _, info = env.step(push)
         terms = info["terms"]
-        # Charge is the clamped acid increment plus a small stock exposure fee.
-        expected = (
-            max(0.0, terms["ph_acid_violation"] - prev_acid_viol)
-            + env.cfg.ph_stock_penalty_fraction * terms["ph_violation"]
+        expected = 0.7 * terms["ph_violation"] + 0.3 * terms["ph_violation_mean"]
+        assert abs(terms["ph_violation_mixed"] - expected) < 1e-12
+        assert (
+            terms["ph_violation_mean"] - 1e-12
+            <= terms["ph_violation_mixed"]
+            <= terms["ph_violation"] + 1e-12
         )
-        assert abs(terms["ph_penalty_charge"] - expected) < 1e-12
-        assert terms["ph_penalty_charge"] >= 0.0  # never a refund
-        prev_acid_viol = terms["ph_acid_violation"]
-        charges.append(terms["ph_penalty_charge"])
-        stock_viols.append(terms["ph_violation"])
-        acid_viols.append(terms["ph_acid_violation"])
+        if terms["ph_violation"] > 0.5:
+            saw_violation = True
+    assert saw_violation  # sustained push must acidify the anode cells
 
-    peak_early_charge = max(charges[:10])
-    assert peak_early_charge > 0.05                      # generation is billed
-    # No heavy re-billing: once acid has piled up (high standing stock violation),
-    # the per-step charge is still far below the old full stock charge.
-    assert stock_viols[-1] > 1.0                          # large standing debt
-    assert charges[-1] < 0.2 * stock_viols[-1]            # but not the full debt
-    # Increment + small-stock hybrid stays far below the old stock-total bill.
-    assert sum(charges) < 0.3 * sum(stock_viols)
+
+def test_level_curves_piecewise_linear_and_bounded() -> None:
+    """The scoring levels are continuous piecewise-linear curves (no staircase
+    plateaus/jumps — the v12/v15 critic-blindness lesson), clamped to [0, 1]."""
+
+    from soilbox_env import _level_score
+
+    u = DEFAULT_CONFIG.uniformity_level_points
+    assert _level_score(0.05, u) == 1.0          # below first breakpoint: clamp
+    assert _level_score(0.15, u) == 0.8          # exact breakpoint
+    assert abs(_level_score(0.20, u) - 0.6) < 1e-12   # midpoint interpolation
+    assert _level_score(0.60, u) == 0.0          # beyond last breakpoint: clamp
+    p = DEFAULT_CONFIG.ph_level_points
+    assert _level_score(0.0, p) == 1.0
+    assert abs(_level_score(1.0, p) - 0.45) < 1e-12
+    assert _level_score(3.0, p) == 0.0
+    # Monotone non-increasing over a fine sweep (more violation never scores higher).
+    for pts in (u, p):
+        xs = np.linspace(0.0, 3.0, 301)
+        ys = [_level_score(float(x), pts) for x in xs]
+        assert all(ys[i] >= ys[i + 1] - 1e-12 for i in range(len(ys) - 1))
+        assert all(0.0 <= y <= 1.0 for y in ys)
 
 
 def test_energy_uses_pair_voltage_difference_not_absolute_offset() -> None:

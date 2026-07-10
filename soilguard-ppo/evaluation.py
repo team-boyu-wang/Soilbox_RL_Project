@@ -30,22 +30,21 @@ import numpy as np
 
 from soilbox_env import (
     DEFAULT_CONFIG,
-    FINAL_SCORE_WEIGHTS,
-    FINAL_SCORE_NORMALIZATION,
     SoilBoxConfig,
     SoilBoxEnv,
     _clip01,
     _coerce_config,
-    _low_is_good_score,
 )
 
-BATTERY_VERSION = "v3.0"
+BATTERY_VERSION = "v5.0"
 
-# Weight of "reached the CV target at least once" in the per-scenario score;
-# the remaining weight goes to the quality score. Engineering choice: reaching
-# the goal stays the single most valuable behaviour but no longer zeroes
-# everything else out.
-REACHED_WEIGHT = 0.40
+# v5.0: per-step integrated scoring. Every step is graded q_t = 0.60*U +
+# 0.20*P + 0.20*E via the env's piecewise-linear level curves (see
+# SoilBoxConfig), and the scenario score is 100 * mean(q_t) over the horizon.
+# The training reward pays the same q_t in per-step instalments, so training
+# return == exam score by construction. (v4.0 briefly used final-state-only
+# three-axis scoring; v3.0 had the 0.40 reached-gate + local_dry axis — both
+# superseded. ``reached``/hold_frac/dry are reported-only since v4.0.)
 
 # Exposure normalisation lines (engineering choices, to be recalibrated
 # against real-box data): exposure = per-step mean violation over the episode.
@@ -200,11 +199,17 @@ def _rollout_scenario(
     min_cv = initial_cv
     below_target_steps = 0
     ph_sum = 0.0
+    ph_mixed_sum = 0.0
     ph_peak = 0.0
     dry_sum = 0.0
     dry_peak = 0.0
     energy = 0.0
+    power_sum = 0.0
     energy_to_target = 0.0
+    quality_sum = 0.0
+    u_sum = 0.0
+    ph_score_sum = 0.0
+    energy_score_sum = 0.0
     final_cv = initial_cv
 
     for t in range(1, cfg.max_steps + 1):
@@ -216,10 +221,18 @@ def _rollout_scenario(
         final_cv = float(info["moisture_cv"])
         min_cv = min(min_cv, final_cv)
         ph_sum += float(terms["ph_violation"])
+        ph_mixed_sum += float(terms["ph_violation_mixed"])
         ph_peak = max(ph_peak, float(terms["ph_violation"]))
         dry_sum += float(terms["local_dry_violation"])
         dry_peak = max(dry_peak, float(terms["local_dry_violation"]))
         energy += float(terms["energy"])
+        power_sum += float(terms["power_phys"])
+        # v5.0: the per-step mini-exam, computed ONCE inside the env and shared
+        # verbatim with the training reward — scoring cannot drift apart.
+        quality_sum += float(terms["step_quality"])
+        u_sum += float(terms["u_score"])
+        ph_score_sum += float(terms["ph_score"])
+        energy_score_sum += float(terms["energy_score"])
         if t_reach == 0:
             energy_to_target = energy
             if final_cv <= target:
@@ -238,40 +251,44 @@ def _rollout_scenario(
         "min_cv": float(min_cv),
         "hold_frac": float(hold_frac),
         "ph_exposure": ph_sum / steps,
+        "ph_exposure_mixed": ph_mixed_sum / steps,
         "ph_peak": ph_peak,
         "dry_exposure": dry_sum / steps,
         "dry_peak": dry_peak,
         "energy": energy,
+        "power_mean": power_sum / steps,
         "energy_to_target": energy_to_target if reached else energy,
+        "quality_mean": quality_sum / steps,
+        "uniformity_level_mean": u_sum / steps,
+        "ph_level_mean": ph_score_sum / steps,
+        "energy_level_mean": energy_score_sum / steps,
         "final_mean_pH": float(np.mean(env.pH)),
         "final_mean_moisture": float(np.mean(env.m)),
     }
 
 
 def score_scenario(metrics: Mapping[str, float]) -> dict[str, float]:
-    """Component scores in [0, 1] and the graded per-scenario score in [0, 100]."""
+    """Package the per-scenario score in [0, 100] from rollout metrics.
 
-    norm = FINAL_SCORE_NORMALIZATION
-    uniformity_score = _low_is_good_score(
-        metrics["final_cv"], norm["moisture_cv_good"], norm["moisture_cv_bad"]
-    )
-    ph_score = _clip01(1.0 - metrics["ph_exposure"] / PH_EXPOSURE_BAD)
-    dry_score = _clip01(1.0 - metrics["dry_exposure"] / DRY_EXPOSURE_BAD)
-    energy_score = _low_is_good_score(metrics["energy"], norm["energy_good"], norm["energy_bad"])
-    quality = (
-        FINAL_SCORE_WEIGHTS["uniformity_score"] * uniformity_score
-        + FINAL_SCORE_WEIGHTS["ph_score"] * ph_score
-        + FINAL_SCORE_WEIGHTS["local_dry_score"] * dry_score
-        + FINAL_SCORE_WEIGHTS["energy_score"] * energy_score
-    )
-    scenario_score = 100.0 * (REACHED_WEIGHT * metrics["reached"] + (1.0 - REACHED_WEIGHT) * quality)
+    Battery v5.0: every step is graded q_t = 0.60*U(cv_t) + 0.20*P(viol_t) +
+    0.20*E(power_t) (piecewise-linear level curves, computed inside the env
+    and shared verbatim with the training reward), and the scenario score is
+    simply 100 * mean(q_t) over the full horizon. Consequences:
+      - reaching uniformity EARLY and HOLDING it both pay (time integral) —
+        the v3.0 "time unscored / hold unscored" defects are gone;
+      - the training return (undiscounted, hooks at 0) EQUALS this score by
+        construction — no training-vs-exam alignment gap can exist.
+    ``reached`` and ``dry_score`` remain reported-only monitoring metrics.
+    """
+
+    dry_score = _clip01(1.0 - metrics["dry_exposure"] / DRY_EXPOSURE_BAD)  # reported only
     return {
-        "uniformity_score": float(uniformity_score),
-        "ph_score": float(ph_score),
+        "uniformity_score": float(metrics["uniformity_level_mean"]),
+        "ph_score": float(metrics["ph_level_mean"]),
         "dry_score": float(dry_score),
-        "energy_score": float(energy_score),
-        "quality_score": float(quality),
-        "scenario_score": float(scenario_score),
+        "energy_score": float(metrics["energy_level_mean"]),
+        "quality_score": float(metrics["quality_mean"]),
+        "scenario_score": float(100.0 * metrics["quality_mean"]),
     }
 
 

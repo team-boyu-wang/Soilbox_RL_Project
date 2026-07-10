@@ -124,34 +124,61 @@ class SoilBoxConfig:
     # In acid_increment mode, add this small fraction of the stock pH exposure
     # to keep training aligned with the evaluation ph_exposure metric.
     ph_stock_penalty_fraction: float = 0.05
+    # ===== v5.0 per-step quality scoring (SHARED by reward and evaluation) =====
+    # Every step is graded like a mini-exam: q = 0.60*U + 0.20*P + 0.20*E, each
+    # component in [0, 1]. The evaluation score is 100 * mean(q) over the
+    # episode; the training reward pays (100/max_steps)*q per step — so the
+    # undiscounted episode return EQUALS the exam score by construction, and
+    # the training-vs-exam alignment gap is eliminated structurally.
+    # Level curves are PIECEWISE-LINEAR breakpoints ((x, score), np.interp,
+    # clamped at both ends): continuous everywhere with region-wise slopes —
+    # graded "levels" without the zero-gradient plateaus / jumps of a staircase
+    # (staircase thresholds are what blinded the critic in v12/v15).
+    #
+    # U(cv): full credit at cv<=0.10; the teacher's working band 0.08-0.15
+    # scores 0.8-1.0; idle's standing 0.3-0.5 scores ~0-0.2 (kills both the
+    # lazy and the delay-sprint degenerate optima via the time integral).
+    uniformity_level_points: tuple[tuple[float, float], ...] = (
+        (0.10, 1.0), (0.15, 0.8), (0.25, 0.4), (0.40, 0.0))
+    # P(viol): viol = ph_peak_weight * worst-cell violation + (1-w) * mean
+    # violation (stock, symmetric, beyond ph_tol). The physically unavoidable
+    # teacher acid (~0.55 mixed) lands mid-curve -> gradients exist BOTH ways
+    # (the old hard 1.0 zero-line sat exactly on the physical floor and made
+    # pH an unwinnable axis).
+    ph_level_points: tuple[tuple[float, float], ...] = (
+        (0.0, 1.0), (0.5, 0.8), (1.0, 0.45), (2.0, 0.0))
+    # Peak-vs-mean mix for the pH stock violation: peak guards the worst cell
+    # (local damage is damage), mean gives dense gradients (dilution/
+    # neutralisation anywhere counts). User decision 2026-07-09: 0.7 peak.
+    ph_peak_weight: float = 0.7
+    # E(power): E = clip01(1 - power/energy_power_ref), where power is the
+    # PHYSICAL per-step power proxy: mean over the 6 electrode pairs of
+    # conductivity(row/col mean moisture) * (pair voltage ratio)^2 — i.e.
+    # P = U*I with I ~ conductivity*U (wet soil conducts more, costs more).
+    # Reference calibrated so the teacher's mean power scores ~0.9
+    # (measured teacher mean power_phys = 0.00716 on the 20-scenario subset).
+    energy_power_ref: float = 0.0716
     w_flux: float = 0.0
-    w_uniformity_goal: float = 10.0
-    w_uniformity: float = 3.0
+    # Optional shaping hook (v13 lesson: use the beyond-diffusion EXCESS, never
+    # raw improvement). Default 0 = pure "reward == exam".
+    w_uniformity_goal: float = 0.0
+    # ---- legacy weights below: NO LONGER used by the v5.0 reward. Kept as
+    # config fields so historical experiment reward_overrides still resolve.
+    w_uniformity: float = 8.0
     w_energy: float = 0.005
     w_ph: float = 1.2
     w_anode_dry: float = 0.0
-    w_local_dry: float = 1.0
+    # Out of the user's three axes since v4.0; reporting-only default 0.
+    w_local_dry: float = 0.0
     w_voltage_jump: float = 0.0
+    # Reporting-only: used for the reported success / reached / hold_frac
+    # metrics, not by any reward or score term.
     target_moisture_cv: float = 0.15
-    # One-shot bonus paid the FIRST time an episode reaches the CV target.
+    # Retired to 0 (v4.0): no target-line income of any kind.
     success_bonus: float = 0.0
-    # Per-step wage paid on EVERY step that ends at or below the CV target.
-    # This is the income side of the reward. With full-horizon episodes the
-    # persistent penalty streams (pH damage is irreversible within an episode
-    # and bleeds every remaining step) make "apply no field" outscore every
-    # active policy — under the v13 weights the rule baseline scored ~ -310
-    # against idle's ~ -160, and PPO faithfully collapsed into idle. Reaching
-    # AND holding uniformity must pay more than idling saves. Unlike a raw
-    # improvement reward this cannot be farmed by churning water: the only way
-    # to collect is to actually be uniform on that step, which matches the
-    # evaluation protocol's hold_frac / t_reach metrics.
-    hold_bonus: float = 3.0
-    # True (default): reaching the target ends the training episode — early
-    # termination itself is a large implicit reward (it stops the per-step
-    # -w_uniformity*CV bleed), which is what drove the v10 "violent sprint".
-    # False: episodes always run max_steps; the objective smoothly becomes
-    # "minimize the area under the CV curve", matching the full-horizon
-    # evaluation protocol and teaching the policy to hold uniformity.
+    hold_bonus: float = 0.0
+    # Episodes always run max_steps; the objective is the integral of per-step
+    # quality over the full horizon, identical to the evaluation.
     terminate_on_success: bool = False
     anode_limiting_moisture: float = 0.22
     local_dry_limiting_moisture: float = 0.22
@@ -171,11 +198,13 @@ def max_electrode_voltage(config: SoilBoxConfig | Mapping[str, Any] | None = Non
     cfg = _coerce_config(config)
     return float(cfg.max_electrode_voltage_v)
 
+# Battery v4.0 exam weights: uniformity dominant, pH and energy equal.
+# (v3.0 was 0.40/0.25/0.20/0.15 over uniformity/pH/local_dry/energy plus a
+# separate 0.40 reached-gate — all superseded.)
 FINAL_SCORE_WEIGHTS: dict[str, float] = {
-    "uniformity_score": 0.40,
-    "ph_score": 0.25,
-    "local_dry_score": 0.20,
-    "energy_score": 0.15,
+    "uniformity_score": 0.60,
+    "ph_score": 0.20,
+    "energy_score": 0.20,
 }
 
 FINAL_SCORE_NORMALIZATION: dict[str, float] = {
@@ -249,6 +278,19 @@ def _low_is_good_score(value: float, good: float, bad: float) -> float:
     return _clip01((bad - value) / (bad - good))
 
 
+def _level_score(value: float, points: tuple[tuple[float, float], ...]) -> float:
+    """Piecewise-linear level curve: interpolate score over (x, score) breakpoints.
+
+    Continuous everywhere (region-wise slopes, no staircase jumps); clamped to
+    the first/last breakpoint score outside the range. Breakpoint x values
+    must be increasing.
+    """
+
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return float(np.interp(value, xs, ys))
+
+
 class SoilBoxEnv(gym.Env):
     """Closed 3x3 electro-osmosis soil box for moisture *redistribution*.
 
@@ -290,6 +332,8 @@ class SoilBoxEnv(gym.Env):
         randomize_initial: bool = False,
         domain_ranges: Mapping[str, tuple[float, float]] | None = None,
         seed: int = SEED,
+        curriculum_difficulty: float | None = None,
+        curriculum_min_contrast: float = 0.6,
     ) -> None:
         super().__init__()
         self.base_config = _coerce_config(config)
@@ -302,6 +346,13 @@ class SoilBoxEnv(gym.Env):
         self.randomize = bool(randomize)
         self.randomize_noise = bool(randomize_noise)
         self.randomize_initial = bool(randomize_initial)
+        # Curriculum (v27): None = off (full training dice, historical
+        # behaviour). A float in [0, 1] reshapes the initial-field dice from
+        # easy to hard — see _sample_initial_field. Takes effect on reset.
+        self.curriculum_difficulty = (
+            None if curriculum_difficulty is None else float(np.clip(curriculum_difficulty, 0.0, 1.0))
+        )
+        self.curriculum_min_contrast = float(curriculum_min_contrast)
         self.domain_ranges = dict(DEFAULT_DOMAIN_RANGES)
         if domain_ranges:
             self.domain_ranges.update(domain_ranges)
@@ -354,24 +405,61 @@ class SoilBoxEnv(gym.Env):
         lo, hi = self.domain_ranges.get("obs_noise", (0.0, 0.2))
         self.obs_noise = float(self._rng.uniform(lo, hi))
 
+    def set_curriculum_difficulty(self, difficulty: float) -> float:
+        """Set curriculum difficulty in [0, 1]; applies from the next reset.
+
+        Called by the curriculum callback via VecEnv.env_method so all
+        parallel workers advance together. Returns the clamped value.
+        """
+
+        self.curriculum_difficulty = float(np.clip(difficulty, 0.0, 1.0))
+        return self.curriculum_difficulty
+
     def _sample_initial_field(self) -> np.ndarray:
         """Draw a fresh initial moisture field (training-time randomization).
 
-        Deliberately WIDER than, and independent from, the frozen evaluation
-        battery: 40% structured wet patterns (column/row/half/diagonal/cells),
-        30% linear ramps in a random direction, 30% iid random fields.
-        A CV floor rejects near-uniform draws so every episode is a real task.
+        Default dice (curriculum_difficulty=None), deliberately WIDER than and
+        independent from the frozen evaluation battery: 40% structured wet
+        patterns (column/row/half/diagonal/cells), 30% linear ramps in a
+        random direction, 30% iid random fields. A CV floor rejects
+        near-uniform draws so every episode is a real task.
+
+        Curriculum mode (v27): ``curriculum_difficulty`` d in [0, 1] reshapes
+        the dice along two axes, easy -> hard:
+          - pattern pool: d < 1/3 only 1-D column/row wet fields; d < 2/3
+            adds the remaining structured patterns and ramps; d >= 2/3 is the
+            full default dice including iid fields.
+          - contrast: the accepted grid is scaled toward its mean by
+            ``c = min_contrast + (1 - min_contrast) * d`` (total water
+            preserved, initial CV scales with c), so easy fields start closer
+            to the target and the hold wage is sampled early.
+        The CV floor is enforced on the SCALED grid — no episode may start
+        near/below the success target, otherwise easy stages would teach
+        idling (the diffusion-solves-it trap: the wage does not ask HOW the
+        field became uniform). min_contrast must be calibrated so the reward
+        audit's ordering (proportional > idle) holds at EVERY difficulty.
         """
 
         rows, cols = self.cfg.grid_rows, self.cfg.grid_cols
         rng = self._rng
+        d = self.curriculum_difficulty
         for _ in range(20):
             wet = float(rng.uniform(0.25, 0.45))
             dry = float(rng.uniform(0.06, 0.14))
             mode = float(rng.random())
+            if d is not None:
+                # Curriculum pattern-pool gating: remap the mode roll so easy
+                # stages only see the simple end of the distribution.
+                if d < 1.0 / 3.0:
+                    mode = 0.0      # structured only (pattern further gated below)
+                elif d < 2.0 / 3.0:
+                    mode = mode * 0.7   # structured + ramps, no iid fields
             if mode < 0.4:
                 grid = np.full((rows, cols), dry)
-                pattern = int(rng.integers(0, 5))
+                if d is not None and d < 1.0 / 3.0:
+                    pattern = int(rng.integers(0, 2))   # columns/rows only (1-D tasks)
+                else:
+                    pattern = int(rng.integers(0, 5))
                 if pattern == 0:
                     grid[:, int(rng.integers(0, cols))] = wet
                 elif pattern == 1:
@@ -399,6 +487,9 @@ class SoilBoxEnv(gym.Env):
                 grid = dry + (wet - dry) * ramp
             else:
                 grid = rng.uniform(0.08, 0.42, size=(rows, cols))
+            if d is not None:
+                contrast = self.curriculum_min_contrast + (1.0 - self.curriculum_min_contrast) * d
+                grid = float(np.mean(grid)) + contrast * (grid - float(np.mean(grid)))
             grid = np.clip(grid, 0.02, 0.5)
             if float(np.std(grid) / (np.mean(grid) + 1e-9)) >= 0.25:
                 return grid
@@ -960,33 +1051,64 @@ class SoilBoxEnv(gym.Env):
         field_energy = float(np.mean(boundary_values**2))
         effective_energy = field_energy
         voltage_loss = float(max(0.0, 1.0 - effective_voltage_ratio))
-        # Stock exposure (symmetric, worst cell): the exam metric — kept in
-        # terms unchanged and comparable across all versions.
-        ph_violation = float(np.max(np.maximum(0.0, np.abs(self.pH - 7.0) - cfg.ph_tol)))
-        # Acid-side-only violation of the worst cell (pH < 7 beyond tolerance),
-        # and the positive step-over-step increase in it. The increment bills a
-        # fresh acidification event once; holding / dilution / neutralisation
-        # gives 0. Base excursions (pH > 7) are intentionally not charged here.
+
+        # --- physical per-step power (v5.0 energy axis): P = U*I per pair,
+        # I ~ conductivity(row/col mean moisture) * U. A row is one series
+        # circuit, so the row MEAN moisture sets its conductivity; wet soil
+        # conducts more and genuinely costs more at the same voltage.
+        moisture_grid = self._grid(self.m)
+        pair_powers: list[float] = []
+        for i in range(cfg.grid_rows):
+            ratio = float(left[i] - right[i]) / max_pair_voltage
+            conductivity = self._moisture_conductivity(float(np.mean(moisture_grid[i, :])))
+            pair_powers.append(conductivity * ratio * ratio)
+        for j in range(cfg.grid_cols):
+            ratio = float(back[j] - front[j]) / max_pair_voltage
+            conductivity = self._moisture_conductivity(float(np.mean(moisture_grid[:, j])))
+            pair_powers.append(conductivity * ratio * ratio)
+        power_phys = float(np.mean(pair_powers))
+
+        # --- pH stock violations (symmetric, beyond tolerance) ---
+        cell_violations = np.maximum(0.0, np.abs(self.pH - 7.0) - cfg.ph_tol)
+        ph_violation = float(np.max(cell_violations))          # worst cell (historic metric)
+        ph_violation_mean = float(np.mean(cell_violations))    # whole-box mean
+        ph_violation_mixed = float(
+            cfg.ph_peak_weight * ph_violation
+            + (1.0 - cfg.ph_peak_weight) * ph_violation_mean
+        )
+        # Acid-increment bookkeeping retained for monitoring only (v5.0 reward
+        # charges the stock via the level curve; increment no longer priced).
         ph_acid_viol = float(np.max(np.maximum(0.0, (7.0 - self.pH) - cfg.ph_tol)))
         ph_acid_increment = max(0.0, ph_acid_viol - self._prev_ph_acid_viol)
         self._prev_ph_acid_viol = ph_acid_viol
-        ph_stock_charge = cfg.ph_stock_penalty_fraction * ph_violation
-        ph_penalty_charge = (
-            ph_acid_increment + ph_stock_charge
-            if cfg.ph_penalty_mode == "acid_increment"
-            else ph_violation
-        )
+
         moisture_cv = self.moisture_cv()
         moisture_cv_gap = float(max(0.0, moisture_cv - cfg.target_moisture_cv))
         local_dry_violation = self._electrode_contact_dry_violation(electrode_action)
         anode_dry_violation = local_dry_violation
+
+        # --- v5.0 per-step quality: the mini-exam this step, in [0, 1] ---
+        u_score = _level_score(moisture_cv, cfg.uniformity_level_points)
+        ph_score = _level_score(ph_violation_mixed, cfg.ph_level_points)
+        energy_score = _clip01(1.0 - power_phys / max(cfg.energy_power_ref, 1e-9))
+        step_quality = (
+            FINAL_SCORE_WEIGHTS["uniformity_score"] * u_score
+            + FINAL_SCORE_WEIGHTS["ph_score"] * ph_score
+            + FINAL_SCORE_WEIGHTS["energy_score"] * energy_score
+        )
+        # Reward pays the mini-exam in instalments: undiscounted episode return
+        # (with all hooks at 0) telescopes to EXACTLY the evaluation score.
+        quality_scale = 100.0 / max(cfg.max_steps, 1)
+        reward_u = quality_scale * FINAL_SCORE_WEIGHTS["uniformity_score"] * u_score
+        reward_ph = quality_scale * FINAL_SCORE_WEIGHTS["ph_score"] * ph_score
+        reward_e = quality_scale * FINAL_SCORE_WEIGHTS["energy_score"] * energy_score
         reward = (
-            cfg.w_flux * flux_activity
-            + cfg.w_uniformity_goal * uniformity_excess
-            - cfg.w_uniformity * moisture_cv_gap
-            - cfg.w_energy * energy
-            - cfg.w_ph * ph_penalty_charge
-            - cfg.w_local_dry * local_dry_violation
+            reward_u
+            + reward_ph
+            + reward_e
+            + cfg.w_flux * flux_activity
+            + cfg.w_uniformity_goal * uniformity_excess  # optional shaping, 0 by default
+            - cfg.w_local_dry * local_dry_violation      # optional safety hook, 0 by default
             - cfg.w_voltage_jump * voltage_jump
         )
         terms = {
@@ -1006,10 +1128,18 @@ class SoilBoxEnv(gym.Env):
             "voltage_drop_v": float(np.max(electrode_action) - np.min(electrode_action)),
             "effective_voltage_ratio": float(effective_voltage_ratio),
             "ph_violation": ph_violation,
+            "ph_violation_mean": ph_violation_mean,
+            "ph_violation_mixed": ph_violation_mixed,
             "ph_acid_violation": ph_acid_viol,
             "ph_acid_increment": float(ph_acid_increment),
-            "ph_stock_charge": float(ph_stock_charge),
-            "ph_penalty_charge": float(ph_penalty_charge),
+            "power_phys": power_phys,
+            "u_score": float(u_score),
+            "ph_score": float(ph_score),
+            "energy_score": float(energy_score),
+            "step_quality": float(step_quality),
+            "reward_u": float(reward_u),
+            "reward_ph": float(reward_ph),
+            "reward_e": float(reward_e),
             "flux": float(flux_activity),
         }
         return float(reward), terms

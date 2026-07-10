@@ -45,17 +45,20 @@ from soilbox_env import (
 
 N_FIELDS = 50
 FIELD_SEED0 = 7000
-# The active policy must beat idle by at least this much episode return,
-# otherwise the gradient toward "act" is too weak to trust.
-MARGIN = 50.0
+# The active policy must beat idle by at least this much episode return.
+# Units since v5.0: EXAM POINTS on the 0-100 scale (the return equals the
+# exam score by construction), so +10 means "clearly better by 10 exam
+# points". (The old +50 was calibrated for the legacy weighted-penalty
+# reward whose returns spanned roughly -400..+250.)
+MARGIN = 10.0
 
+# v5.0 reward structure: per-step quality instalments (u/ph/e) + optional hooks.
 REWARD_COMPONENTS = (
-    "goal_excess",
-    "hold_bonus",
-    "cv_penalty",
-    "ph_penalty",
+    "reward_u",
+    "reward_ph",
+    "reward_e",
+    "shaping_excess",
     "dry_penalty",
-    "energy_penalty",
 )
 
 
@@ -87,10 +90,23 @@ def proportional_policy(obs: np.ndarray, cfg: SoilBoxConfig, gain: float = 80.0)
     return np.concatenate([left, right, front, back]).astype(np.float32)
 
 
-def sample_training_fields(cfg: SoilBoxConfig, n_fields: int, seed0: int) -> list[np.ndarray]:
+def sample_training_fields(
+    cfg: SoilBoxConfig,
+    n_fields: int,
+    seed0: int,
+    *,
+    curriculum_difficulty: float | None = None,
+    curriculum_min_contrast: float = 0.6,
+) -> list[np.ndarray]:
     """Draw initial fields from the exact dice the trainer uses."""
 
-    env = SoilBoxEnv(cfg, randomize_initial=True, seed=seed0)
+    env = SoilBoxEnv(
+        cfg,
+        randomize_initial=True,
+        seed=seed0,
+        curriculum_difficulty=curriculum_difficulty,
+        curriculum_min_contrast=curriculum_min_contrast,
+    )
     fields = []
     for k in range(n_fields):
         env.reset(seed=seed0 + k)
@@ -113,15 +129,13 @@ def rollout(policy_fn: Callable[[np.ndarray], np.ndarray], cfg: SoilBoxConfig,
         obs, reward, terminated, truncated, info = env.step(policy_fn(obs))
         total += reward
         terms = info["terms"]
-        comp["goal_excess"] += cfg.w_uniformity_goal * terms["uniformity_excess"]
-        comp["hold_bonus"] += terms.get("hold_bonus", 0.0)
-        comp["cv_penalty"] -= cfg.w_uniformity * terms.get("moisture_cv_gap", terms["moisture_cv"])
-        # The pH component of the RETURN uses whatever the env actually charged
-        # (stock or acid-increment); the stock exposure is tracked separately as
-        # the exam-relevant metric.
-        comp["ph_penalty"] -= cfg.w_ph * terms.get("ph_penalty_charge", terms["ph_violation"])
+        # v5.0: the reward IS the per-step exam instalment; read the actual
+        # paid components straight from terms.
+        comp["reward_u"] += terms["reward_u"]
+        comp["reward_ph"] += terms["reward_ph"]
+        comp["reward_e"] += terms["reward_e"]
+        comp["shaping_excess"] += cfg.w_uniformity_goal * terms["uniformity_excess"]
         comp["dry_penalty"] -= cfg.w_local_dry * terms["local_dry_violation"]
-        comp["energy_penalty"] -= cfg.w_energy * terms["energy"]
         ph_exposure_sum += float(terms["ph_violation"])
         if info["success"]:
             hold_steps += 1
@@ -138,7 +152,13 @@ def rollout(policy_fn: Callable[[np.ndarray], np.ndarray], cfg: SoilBoxConfig,
     }
 
 
-def audit(cfg: SoilBoxConfig, n_fields: int = N_FIELDS) -> dict[str, dict[str, float]]:
+def audit(
+    cfg: SoilBoxConfig,
+    n_fields: int = N_FIELDS,
+    *,
+    curriculum_difficulty: float | None = None,
+    curriculum_min_contrast: float = 0.6,
+) -> dict[str, dict[str, float]]:
     """Mean per-policy stats over the shared field batch."""
 
     policies: dict[str, Callable[[np.ndarray], np.ndarray]] = {
@@ -146,7 +166,13 @@ def audit(cfg: SoilBoxConfig, n_fields: int = N_FIELDS) -> dict[str, dict[str, f
         "rule": lambda obs: rule_policy(obs, cfg.n_cells, max_electrode_voltage(cfg)),
         "proportional": lambda obs: proportional_policy(obs, cfg),
     }
-    fields = sample_training_fields(cfg, n_fields, FIELD_SEED0)
+    fields = sample_training_fields(
+        cfg,
+        n_fields,
+        FIELD_SEED0,
+        curriculum_difficulty=curriculum_difficulty,
+        curriculum_min_contrast=curriculum_min_contrast,
+    )
     results: dict[str, dict[str, float]] = {}
     for name, policy in policies.items():
         rows = [rollout(policy, cfg, field, seed=FIELD_SEED0 + i) for i, field in enumerate(fields)]
@@ -156,16 +182,74 @@ def audit(cfg: SoilBoxConfig, n_fields: int = N_FIELDS) -> dict[str, dict[str, f
     return results
 
 
+CURRICULUM_AUDIT_DIFFICULTIES = (0.0, 0.25, 0.5, 0.75, 1.0)
+
+
+def curriculum_audit(
+    cfg: SoilBoxConfig,
+    n_fields: int = N_FIELDS,
+    *,
+    min_contrast: float = 0.6,
+    difficulties: tuple[float, ...] = CURRICULUM_AUDIT_DIFFICULTIES,
+    margin: float = MARGIN,
+    idle_reach_slack: float = 0.10,
+) -> bool:
+    """The curriculum gate (v27): the reward ordering must hold at EVERY level.
+
+    The trap this guards against: easy fields sit closer to the target, and if
+    diffusion alone (idle) can finish the job there disproportionately often,
+    the hold wage pays the do-nothing policy and the curriculum's first lesson
+    becomes idling — the v12 collapse, served on purpose.
+
+    Two checks per level:
+    1. Reward ordering (the battle-tested gate): proportional out-earns idle
+       by the margin, and idle is not the top scorer.
+    2. COMPARATIVE idle reach: measured d=1.0 (the historical full dice, which
+       never collapsed under a correct ordering) has ~0.36 idle-reachable
+       episodes — an inherent property of the pattern pool, not curable by
+       contrast (single wet cells diffuse away regardless). Easy levels must
+       not be materially more idle-solvable than that baseline
+       (reach(d) <= reach(1.0) + idle_reach_slack).
+    """
+
+    baseline = audit(
+        cfg, n_fields, curriculum_difficulty=1.0, curriculum_min_contrast=min_contrast
+    )
+    baseline_idle_reach = baseline["idle"]["reached"]
+    print(f"baseline (d=1.00 = historical dice): idle reach rate = {baseline_idle_reach:.2f}")
+    all_ok = True
+    for d in difficulties:
+        results = (
+            baseline
+            if d == 1.0
+            else audit(cfg, n_fields, curriculum_difficulty=d, curriculum_min_contrast=min_contrast)
+        )
+        idle_reach = results["idle"]["reached"]
+        ok, msg = judge(results, margin=margin)
+        idle_ok = idle_reach <= baseline_idle_reach + idle_reach_slack
+        level_ok = ok and idle_ok
+        all_ok = all_ok and level_ok
+        print(f"--- difficulty d={d:.2f} (min_contrast={min_contrast:g}) ---")
+        print(format_audit_table(results))
+        print(f"  ordering: {msg}")
+        print(
+            f"  idle reach rate = {idle_reach:.2f} "
+            f"(need <= baseline {baseline_idle_reach:.2f} + {idle_reach_slack:g}) -> {idle_ok}"
+        )
+        print(f"  level PASS = {level_ok}")
+    return all_ok
+
+
 def format_audit_table(results: dict[str, dict[str, float]]) -> str:
     header = (
-        f"{'policy':<14}{'return':>10}{'std':>8}{'excess':>8}{'hold':>8}{'cv_pen':>9}"
-        f"{'ph_pen':>9}{'dry_pen':>9}{'reach':>7}{'hold_n':>8}{'phExp':>8}{'final_cv':>10}"
+        f"{'policy':<14}{'return':>10}{'std':>8}{'r_u':>8}{'r_ph':>8}{'r_e':>8}"
+        f"{'excess':>8}{'dry_pen':>9}{'reach':>7}{'hold_n':>8}{'phExp':>8}{'final_cv':>10}"
     )
     lines = [header]
     for name, m in results.items():
         lines.append(
-            f"{name:<14}{m['return']:>10.1f}{m['return_std']:>8.1f}{m['goal_excess']:>8.2f}"
-            f"{m['hold_bonus']:>8.1f}{m['cv_penalty']:>9.1f}{m['ph_penalty']:>9.1f}"
+            f"{name:<14}{m['return']:>10.1f}{m['return_std']:>8.1f}{m['reward_u']:>8.1f}"
+            f"{m['reward_ph']:>8.1f}{m['reward_e']:>8.1f}{m['shaping_excess']:>8.2f}"
             f"{m['dry_penalty']:>9.1f}{m['reached']:>7.2f}{m['hold_steps']:>8.1f}"
             f"{m['ph_exposure']:>8.3f}{m['final_cv']:>10.3f}"
         )
@@ -212,9 +296,24 @@ def main() -> None:
     parser.add_argument("--w-ph", type=float, default=None)
     parser.add_argument("--ph-penalty-mode", default=None, choices=["stock", "acid_increment"])
     parser.add_argument("--fields", type=int, default=N_FIELDS)
+    parser.add_argument("--curriculum-audit", action="store_true",
+                        help="v27 gate: rerun the three-policy audit at each curriculum "
+                             "difficulty level; every level must pass.")
+    parser.add_argument("--curriculum-min-contrast", type=float, default=0.6)
     args = parser.parse_args()
 
     cfg = build_config(args)
+    if args.curriculum_audit:
+        print(f"Curriculum audit on {args.fields} fields per difficulty (seed0={FIELD_SEED0})")
+        print(f"weights: hold_bonus={cfg.hold_bonus:g} w_ph={cfg.w_ph:g} "
+              f"ph_penalty_mode={cfg.ph_penalty_mode}")
+        ok = curriculum_audit(cfg, n_fields=args.fields, min_contrast=args.curriculum_min_contrast)
+        print(f"curriculum_audit_pass = {ok}")
+        if not ok:
+            print("CURRICULUM AUDIT FAILED: some difficulty level lets idling compete "
+                  "(likely the easy end). Raise --curriculum-min-contrast and re-audit. "
+                  "Do not launch training.")
+        sys.exit(0 if ok else 1)
     print(f"Reward audit on {args.fields} random training fields (seed0={FIELD_SEED0})")
     print(f"weights: hold_bonus={cfg.hold_bonus:g} w_uniformity_goal={cfg.w_uniformity_goal:g} "
           f"w_uniformity={cfg.w_uniformity:g} w_ph={cfg.w_ph:g} w_local_dry={cfg.w_local_dry:g} "
@@ -225,9 +324,10 @@ def main() -> None:
     print(f"judge_reward_prefers_action = {ok}")
     print(f"  {msg}")
     if not ok:
-        print("AUDIT FAILED: the training reward still prefers idling. "
-              "Fix the weights (hold_bonus first, then w_uniformity_goal) and re-audit. "
-              "Do not launch training.")
+        print("AUDIT FAILED: the training reward does not clearly prefer acting "
+              "over idling. Since v5.0 reward == exam, fix the LEVEL CURVES "
+              "(uniformity_level_points first) or the component weights, then "
+              "re-audit. Do not launch training.")
     sys.exit(0 if ok else 1)
 
 
