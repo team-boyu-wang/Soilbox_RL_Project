@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Train PPO agents for the literature-backed SoilGuard soil-box environment."""
+"""为有文献物理支撑的 SoilGuard 土箱环境训练 PPO 智能体(训练管线主模块)。"""
 
 from __future__ import annotations
 
@@ -26,13 +26,13 @@ from soilbox_env import (
 
 
 def ppo_policy_of(model) -> Callable:
-    """Wrap a Stable-Baselines3 model as policy_fn(obs) -> action."""
+    """把 Stable-Baselines3 模型包装成 policy_fn(obs) -> action,供考卷评估调用。"""
 
     return lambda obs: model.predict(obs, deterministic=True)[0]
 
 
 class ClearMLTrainingDashboardWriter:
-    """Forward selected Stable-Baselines3 training scalars to ClearML panels."""
+    """把选定的 Stable-Baselines3 训练标量转发到 ClearML 面板(挂进 SB3 Logger 的输出格式)。"""
 
     SCALARS = {
         "rollout/ep_rew_mean": ("Training Outcome", "episode_reward", 1.0),
@@ -99,8 +99,8 @@ def make_training_dashboard_callback(
             self.history: list[dict[str, float]] = []
             self.metrics_path = None
             self.plot_path = None
-            # Keyed by env index: with parallel envs a single shared value
-            # would compare actions across different environments.
+            # 按环境序号分开保存:并行环境下若共用一个值,
+            # 会拿不同环境的动作互相比较。
             self.prev_action: dict[int, np.ndarray] = {}
             if dashboard_dir is not None:
                 dashboard_dir.mkdir(parents=True, exist_ok=True)
@@ -123,7 +123,7 @@ def make_training_dashboard_callback(
                 cfg = info.get("config")
                 if cfg is not None and terms:
                     if "reward_u" in terms:
-                        # v5.0 reward: per-step exam instalments, read directly.
+                        # v5.0 奖励:考卷分数按步分期支付,直接读取。
                         self._append_rollout_value("reward_uniformity_component", terms["reward_u"])
                         self._append_rollout_value("reward_ph_component", terms["reward_ph"])
                         self._append_rollout_value("reward_energy_component", terms["reward_e"])
@@ -131,7 +131,7 @@ def make_training_dashboard_callback(
                         self._append_rollout_value("raw_power_phys", terms["power_phys"])
                         self._append_rollout_value("raw_ph_violation_mixed", terms["ph_violation_mixed"])
                     else:
-                        # Legacy (pre-v5.0) weighted-penalty reward structure.
+                        # 旧版(v5.0 之前)加权惩罚式奖励结构。
                         self._append_rollout_value("reward_flux_component", cfg.w_flux * terms["flux"])
                         self._append_rollout_value(
                             "reward_uniformity_goal_component",
@@ -213,14 +213,14 @@ def make_training_dashboard_callback(
                 distribution = self.model.policy.get_distribution(obs_tensor)
                 metrics["policy_entropy"] = float(distribution.entropy().mean().item())
 
-            # KL(pi || pi_BC) of the most recent PPO update (KLToBCPPO only).
-            # _on_rollout_end fires before the upcoming train(), so this lags
-            # one iteration — fine for trend monitoring.
+            # 最近一次 PPO 更新的 KL(pi || pi_BC)(仅 KLToBCPPO 有)。
+            # _on_rollout_end 在下一次 train() 之前触发,所以数值滞后
+            # 一个迭代 —— 用来看趋势足够。
             kl_to_bc = getattr(self.model, "last_kl_to_bc", None)
             if kl_to_bc is not None and np.isfinite(kl_to_bc):
                 metrics["kl_to_bc"] = float(kl_to_bc)
 
-            # Curriculum state published by the curriculum callback (v27).
+            # 课程学习回调发布的课程状态(v27)。
             difficulty = getattr(self.model, "curriculum_difficulty_current", None)
             if difficulty is not None:
                 metrics["curriculum_difficulty"] = float(difficulty)
@@ -228,8 +228,8 @@ def make_training_dashboard_callback(
             if rolling is not None:
                 metrics["curriculum_rolling_success"] = float(rolling)
 
-            # Exploration-noise level (v28): the actual log_std and, when the
-            # anneal callback is active, its descending cap.
+            # 探索噪声水平(v28):实际的 log_std,以及退火回调激活时
+            # 其逐步下降的上限。
             if hasattr(self.model.policy, "log_std"):
                 metrics["log_std_mean"] = float(
                     self.model.policy.log_std.detach().mean().item()
@@ -402,7 +402,7 @@ def attach_training_logger(
     run_name: str,
     verbose: int,
 ) -> None:
-    """Attach ClearML/TensorBoard writers without changing PPO training logic."""
+    """给模型挂上 ClearML/TensorBoard 记录器,不改动 PPO 训练逻辑(train_ppo 装配时调用)。"""
 
     if task is None and tensorboard_log is None:
         return
@@ -476,33 +476,34 @@ def pretrain_policy_bc(
     seed: int = SEED,
     batch_size: int = 128,
     learning_rate: float = 1e-3,
+    teacher_fn: Callable | None = None,
 ) -> dict[str, float]:
-    """Behavior-clone the proportional controller into ``model.policy``.
+    """把比例控制器教师行为克隆进 ``model.policy``(BC 热启动)。
 
-    Warm start for the v15 diagnosis: with random initial fields the
-    directional gradients cancel in weight space while the "act less" gradient
-    is coherent, so PPO from scratch collapses into idling and never samples
-    the hold-bonus income. Supervised imitation has none of those problems —
-    each (obs, action) pair is an independent clean label — so the
-    "read the field, push toward the dry side" mapping is carved in first and
-    PPO then starts INSIDE the wage region, where both income and penalty
-    gradients are alive.
+    针对 v15 诊断的热启动:初始场随机时,方向性梯度在权重空间里互相抵消,
+    而"少动"的梯度是相干的,于是从零开始的 PPO 会塌缩成不作为,永远采样
+    不到保持奖金这份收入。监督模仿没有这些问题 —— 每个 (obs, action) 对
+    都是独立的干净标签 —— 先把"读场、往干侧推"的映射刻进网络,PPO 随后
+    直接从工资区内部起步,此时收入和惩罚两侧的梯度都是活的。
 
-    Trains only the action mean (MSE); the value head and log_std receive no
-    gradient, and PPO's own optimizer state is untouched.
+    只训练动作均值(MSE);价值头和 log_std 不接收梯度,PPO 自身的优化器
+    状态也不被触碰。
+    由 train_ppo 在 bc_pretrain=True 时调用;teacher_fn 为 None 时默认用
+    2D 比例控制器,3D 运行由调用方传入 proportional_policy_3d。
     """
 
     import torch
 
-    from reward_audit import proportional_policy
+    if teacher_fn is None:
+        # 默认教师:2D 比例控制器(v17 谱系)。
+        # 3D 运行通过 teacher_fn 参数传入 proportional_policy_3d。
+        from reward_audit import proportional_policy as teacher_fn
 
-    # Demonstrations are truncated shortly after the controller reaches the
-    # target: the controller uniformizes in a few dozen steps and then idles,
-    # so full 180-step episodes are ~2/3 "already uniform -> action ~ 0"
-    # pairs. That imbalance dominates the MSE and clones a policy that points
-    # the right way but is far too timid to actually reach (measured: ~0.6 V
-    # on the canonical field). Keeping the transport phase plus a short
-    # holding tail teaches both "push hard" and "ease off once uniform".
+    # 示教数据在控制器达标后不久即截断:控制器几十步内完成均匀化然后闲置,
+    # 完整的 180 步回合约有 2/3 是"已均匀 -> 动作 ~ 0"的样本。这种不平衡
+    # 会主导 MSE,克隆出一个方向正确却过于胆小、实际到不了目标的策略
+    # (实测:标准场上仅 ~0.6 V)。保留输运阶段外加一小段保持尾巴,
+    # 既教"用力推",也教"均匀后收力"。
     hold_tail_steps = 20
     env = make_env(seed)
     obs_list: list[np.ndarray] = []
@@ -511,7 +512,7 @@ def pretrain_policy_bc(
         obs, _ = env.reset(seed=seed + ep)
         below_target_steps = 0
         for _ in range(env.cfg.max_steps):
-            action = proportional_policy(obs, env.cfg)
+            action = teacher_fn(obs, env.cfg)
             obs_list.append(np.asarray(obs, dtype=np.float32))
             act_list.append(np.asarray(action, dtype=np.float32))
             obs, _, terminated, truncated, info = env.step(action)
@@ -556,24 +557,21 @@ def pretrain_policy_bc(
     }
 
 
-# The KLToBCPPO.train() body below is copied from this SB3 version's PPO.train()
-# with one marked addition; bump this together with requirements when upgrading.
+# 下方 KLToBCPPO.train() 的函数体抄自该 SB3 版本的 PPO.train(),只有一处
+# 带标记的新增;升级 SB3 时请连同 requirements 一起更新此版本号。
 KL_BC_SB3_BASE_VERSION = "2.9.0"
 
 
 def _make_kl_to_bc_ppo():
-    """Build the KLToBCPPO class (lazy import, mirrors the module's SB3 usage).
+    """构建 KLToBCPPO 类(惰性导入,与本模块其余 SB3 用法一致;train_ppo 在 kl_bc_coef>0 时调用)。
 
-    v25 anti-erosion tether: across v19/v20/v21/v24 PPO fine-tuning always
-    slid AWAY from the BC anchor — at the anchor the hold wage is a
-    near-constant within every batch (all episodes reach), so it is invisible
-    to the policy gradient, while the batch variance lives on the cost side
-    (pH/dry vary with field difficulty). The one coherent gradient direction
-    is "save costs, push less": a one-way ratchet out of the wage region.
-    The tether adds ``kl_bc_coef * KL(pi_theta || pi_BC)`` to the loss, where
-    pi_BC is the FROZEN post-BC policy. The Gaussian KL includes variance
-    terms, so it also suppresses the log_std regrowth observed in v24
-    (sigma 0.067 -> 0.149 with ent_coef=0).
+    v25 抗侵蚀系绳:在 v19/v20/v21/v24 中,PPO 微调总是从 BC 锚点滑走 ——
+    在锚点处,保持工资在每个 batch 内近似常数(所有回合都达标),对策略
+    梯度不可见;而 batch 内的方差全在成本侧(pH/干燥随场地难度变化)。
+    唯一相干的梯度方向就是"省成本、少推":一个滑出工资区的单向棘轮。
+    系绳在损失里加 ``kl_bc_coef * KL(pi_theta || pi_BC)``,其中 pi_BC 是
+    冻结的 BC 后策略。高斯 KL 含方差项,因此还能压制 v24 观察到的 log_std
+    回涨(ent_coef=0 时 sigma 0.067 -> 0.149)。
     """
 
     import torch as th
@@ -587,15 +585,15 @@ def _make_kl_to_bc_ppo():
             super().__init__(*args, **kwargs)
             self.kl_bc_coef = float(kl_bc_coef)
             self.bc_policy = None
-            # Mean KL of the most recent update, read by the dashboard callback.
+            # 最近一次更新的平均 KL,由面板回调读取。
             self.last_kl_to_bc = float("nan")
 
         def set_bc_reference(self) -> None:
-            """Freeze a copy of the CURRENT (post-BC) policy as the KL anchor.
+            """把当前(BC 后)策略冻结一份副本作为 KL 锚点(BC 热启动完成后由 train_ppo 调用)。
 
-            Built as a fresh instance + load_state_dict instead of deepcopy:
-            after BC training the live policy caches graph-connected tensors
-            (``action_dist``) that torch refuses to deepcopy.
+            用"新建实例 + load_state_dict"而不是 deepcopy:BC 训练之后,
+            在线策略缓存着连在计算图上的张量(``action_dist``),
+            torch 拒绝对其 deepcopy。
             """
 
             bc_policy = self.policy_class(
@@ -612,15 +610,15 @@ def _make_kl_to_bc_ppo():
             self.bc_policy = bc_policy
 
         def _excluded_save_params(self) -> list[str]:
-            # The frozen reference is training-time state; keep saved zips
-            # loadable by plain PPO.load for evaluation.
+            # 冻结参考只是训练期状态;排除掉它,保存的 zip 才能被
+            # 普通 PPO.load 加载用于评估。
             return super()._excluded_save_params() + ["bc_policy"]
 
         def train(self) -> None:
-            """PPO.train() from stable-baselines3 2.9.0 + the KL-to-BC term.
+            """stable-baselines3 2.9.0 的 PPO.train() 原文 + KL-to-BC 项。
 
-            The addition is the block marked ``# >>> KL-to-BC``; everything
-            else is verbatim so kl_bc_coef=0 reproduces vanilla PPO.
+            新增只有标记为 ``# >>> KL-to-BC`` 的代码块;其余逐字照抄,
+            因此 kl_bc_coef=0 时可复现原版 PPO。
             """
 
             self.policy.set_training_mode(True)
@@ -674,9 +672,9 @@ def _make_kl_to_bc_ppo():
                         entropy_loss = -th.mean(entropy)
                     entropy_losses.append(entropy_loss.item())
 
-                    # >>> KL-to-BC: analytic Gaussian KL between the current
-                    # policy and the frozen post-BC reference on this
-                    # minibatch's observations (extra tiny forward pass).
+                    # >>> KL-to-BC:在本 minibatch 的观测上,计算当前策略
+                    # 与冻结的 BC 后参考策略之间的解析高斯 KL
+                    # (额外一次很小的前向传播)。
                     if self.bc_policy is not None and self.kl_bc_coef > 0.0:
                         current_dist = self.policy.get_distribution(rollout_data.observations)
                         with th.no_grad():
@@ -749,18 +747,18 @@ def make_best_checkpoint_callback(
     seed0: int,
     every_steps: int,
     task=None,
+    eval_fn: Callable | None = None,
+    subset_indices=None,
 ):
-    """Periodic battery-subset exam of the current policy; keep the best zip.
+    """周期性用考卷子集小测当前策略,保留得分最高的 zip(最优检查点回调)。
 
-    Harvest, not steering: saving snapshots does not touch training dynamics.
-    Motivated by v24, where the training peak (ep_rew +142 at 143k steps,
-    near-anchor behaviour) was lost because only the final model was saved.
-    The subset is one variant (s0) per family — 20 scenarios, ~seconds per
-    exam — evaluated deterministically on the standard environment with the
-    official per-scenario seeds. The first exam fires immediately, scoring
-    the pure post-BC policy so later checkpoints are comparable to the anchor
-    on the same subset. Official full-battery scores are still produced after
-    training for both the final and the best model.
+    只收割、不转向:保存快照不触碰训练动力学。动机来自 v24 —— 当时训练
+    峰值(143k 步 ep_rew +142,行为接近锚点)因只保存最终模型而丢失。
+    子集为每族一个变体(s0)—— 20 个场景,每次小测约几秒 —— 在标准环境
+    上按官方逐场景种子做确定性评估。第一次小测立即触发,先给纯 BC 后策略
+    打分,使后续检查点能在同一子集上与锚点对比。训练结束后,最终模型和
+    最优模型仍会各自产出官方完整考卷分数。
+    由 run_train_standard 构建,作为 extra_callbacks 传入 train_ppo。
     """
 
     if every_steps <= 0:
@@ -768,9 +766,13 @@ def make_best_checkpoint_callback(
 
     from stable_baselines3.common.callbacks import BaseCallback
 
-    from evaluation import SCENARIOS, VARIANTS_PER_FAMILY
+    if eval_fn is None:
+        eval_fn = evaluate_v2
+    if subset_indices is None:
+        from evaluation import SCENARIOS, VARIANTS_PER_FAMILY
 
-    subset = tuple(range(0, len(SCENARIOS), VARIANTS_PER_FAMILY))
+        subset_indices = tuple(range(0, len(SCENARIOS), VARIANTS_PER_FAMILY))
+    subset = tuple(subset_indices)
 
     class BestCheckpointCallback(BaseCallback):
         def __init__(self) -> None:
@@ -782,7 +784,7 @@ def make_best_checkpoint_callback(
             self.model_path = run_dir / "soilguard_ppo_best.zip"
 
         def _evaluate_now(self) -> None:
-            result = evaluate_v2(
+            result = eval_fn(
                 ppo_policy_of(self.model), config=cfg, seed0=seed0, scenario_indices=subset
             )
             agg = result["aggregate"]
@@ -833,16 +835,14 @@ def make_curriculum_callback(
     start: float = 0.0,
     task=None,
 ):
-    """Adaptive curriculum (v27): raise difficulty when the policy earns it.
+    """自适应课程学习(v27):策略挣够了资格才提升难度(课程学习回调)。
 
-    Counts end-of-episode success (uniform AT the final step — reach AND hold,
-    stricter than merely touching the target) over a rolling window. When the
-    rolling rate clears ``threshold`` with a full window at the current level,
-    difficulty rises by ``step`` and is broadcast to every parallel worker via
-    VecEnv.env_method; the window resets so each level is judged on its own
-    episodes. If the policy never clears the bar, difficulty simply stays put —
-    a run stuck at level 0 is itself the diagnosis (cannot learn the easiest
-    task from scratch).
+    在滚动窗口内统计回合结束时的成功(最后一步仍均匀 —— 达标且守住,
+    比只碰到过目标更严格)。当滚动成功率在当前难度下以满窗清过
+    ``threshold``,难度提升 ``step``,并经 VecEnv.env_method 广播给所有
+    并行 worker;窗口随之清零,让每级难度只凭自己的回合受评。若策略始终
+    过不了线,难度原地不动 —— 卡在 0 级本身就是诊断(最简单的任务都
+    从零学不会)。
     """
 
     from stable_baselines3.common.callbacks import BaseCallback
@@ -856,8 +856,8 @@ def make_curriculum_callback(
             self.advance_history: list[dict[str, float]] = []
 
         def _publish(self) -> None:
-            # Read by the dashboard callback at rollout end (same pattern as
-            # last_kl_to_bc) so difficulty lands in the jsonl/ClearML curves.
+            # 面板回调在 rollout 结束时读取(与 last_kl_to_bc 同一套模式),
+            # 使难度进入 jsonl/ClearML 曲线。
             self.model.curriculum_difficulty_current = float(self.difficulty)
             if self.successes:
                 self.model.curriculum_rolling_success = float(
@@ -916,23 +916,20 @@ def make_log_std_anneal_callback(
     anneal_steps: int,
     curriculum_cb=None,
 ):
-    """v28: shrink the exploration noise once the curriculum tops out.
+    """v28:课程学习到顶之后收缩探索噪声(噪声退火回调)。
 
-    v27 showed the structural conflict of from-scratch training: launching
-    needs big noise (sigma = 1.0 was what let random pushes stumble into the
-    wage and start learning), but PPO shrinks log_std extremely slowly on its
-    own (17 -> 11.7 entropy over 3M steps, sigma still 0.64), so the policy
-    keeps optimising for its noise-injected self — saturated means, and the
-    deterministic exam policy turns into full-voltage bombardment (energy
-    42 -> 79, exam decaying while training success stays 0.9+).
+    v27 暴露了从零训练的结构性冲突:起步需要大噪声(正是 sigma = 1.0
+    才让随机推动碰进工资区、开始学习),但 PPO 自己收缩 log_std 极慢
+    (3M 步熵 17 -> 11.7,sigma 仍 0.64),于是策略一直在为"带噪声的
+    自己"优化 —— 均值饱和,确定性考卷策略退化成满电压轰炸(能耗
+    42 -> 79,考分下滑而训练成功率保持 0.9+)。
 
-    Mechanics: once ``curriculum_cb.difficulty`` reaches 1.0 (or immediately,
-    if no curriculum callback is given), a per-step CAP on log_std descends
-    linearly from the policy's current max to ``anneal_to`` over
-    ``anneal_steps`` steps: ``log_std.data.clamp_(max=cap)``. A cap, not an
-    assignment — PPO may shrink noise faster than the schedule, it just
-    cannot stay above it. -2.7 (sigma ~ 6.7% half-range ~ 1.3 V) is the
-    fine-operation noise level validated by v24/v25.
+    机制:一旦 ``curriculum_cb.difficulty`` 达到 1.0(未提供课程回调则
+    立即生效),对 log_std 施加逐步的上限,从策略当前最大值经
+    ``anneal_steps`` 步线性降到 ``anneal_to``:``log_std.data.clamp_(max=cap)``。
+    是上限而非赋值 —— PPO 可以比日程更快地收缩噪声,只是不能高于上限。
+    -2.7(sigma ~ 半量程的 6.7% ~ 1.3 V)是 v24/v25 验证过的精细操作
+    噪声水平。
     """
 
     if anneal_steps <= 0:
@@ -963,7 +960,7 @@ def make_log_std_anneal_callback(
             cap = self.anneal_from + progress * (anneal_to - self.anneal_from)
             with th.no_grad():
                 self.model.policy.log_std.data.clamp_(max=cap)
-            # Read by the dashboard callback at rollout end.
+            # 面板回调在 rollout 结束时读取。
             self.model.log_std_cap_current = float(cap)
             if not self.completed and progress >= 1.0:
                 self.completed = True
@@ -977,9 +974,8 @@ def make_log_std_anneal_callback(
             return True
 
         def _on_training_end(self) -> None:
-            # The final train() update can nudge log_std back above the cap
-            # with no rollout following to re-clamp it; the saved model must
-            # honour the schedule.
+            # 最后一次 train() 更新可能把 log_std 顶回上限之上,而后面
+            # 没有 rollout 再来钳制;保存下来的模型必须遵守退火日程。
             self._apply()
 
     return LogStdAnnealCallback()
@@ -1003,24 +999,23 @@ def train_ppo(
     bc_pretrain: bool = False,
     bc_episodes: int = 300,
     bc_epochs: int = 20,
+    bc_teacher_fn: Callable | None = None,   # None = 用 2D 比例控制器教师
     after_bc: Callable | None = None,
     extra_callbacks: list | None = None,
 ):
-    """Train one PPO model on SoilBoxEnv instances built by ``make_env(seed)``.
+    """在 ``make_env(seed)`` 构建的 SoilBoxEnv 实例上训练一个 PPO 模型。
 
-    ``n_envs > 1`` collects rollouts from that many environment processes in
-    parallel (SubprocVecEnv), which is the multi-core speed-up: the env stepping
-    is pure single-threaded Python and dominates wall-clock at n_envs=1.
-    ``n_steps`` is scaled to ``ROLLOUT_STEPS_TOTAL // n_envs`` so every update
-    still uses the same total batch (2048 transitions) as the serial protocol.
-    Note: parallel rollouts change data ordering, so runs are not bit-for-bit
-    reproducible against serial ones with the same seed.
+    由 run_train_standard 调用;BC 热启动、KL 系绳与各回调都在这里装配。
+    ``n_envs > 1`` 用同样数量的环境进程并行收集 rollout(SubprocVecEnv),
+    这就是多核加速点:环境步进是纯单线程 Python,n_envs=1 时主导墙钟时间。
+    ``n_steps`` 缩放为 ``ROLLOUT_STEPS_TOTAL // n_envs``,每次更新仍使用
+    与串行协议相同的总批量(2048 条转移)。注意:并行 rollout 会改变数据
+    顺序,同种子下与串行运行不能逐位复现。
 
-    ``log_std_init=2.0`` (initial action std ~7.4 V, half the +/-15 V range)
-    instead of the SB3 default 0.0 (std 1 V, 7% of range): the uniformity task
-    needs coordinated multi-electrode pushes, and with default exploration PPO
-    stalls in the do-nothing local optimum (verified: default std plateaued at
-    CV~0.31 after 500k steps; boosted std reached CV~0.18 by 200k).
+    历史教训:曾用 ``log_std_init=2.0``(初始动作 std ~7.4 V,即 +/-15 V
+    量程的一半)替代 SB3 默认 0.0(std 1 V,量程的 7%):均匀化任务需要
+    多电极协同推动,默认探索下 PPO 卡死在不作为的局部最优(实测:默认
+    std 在 50 万步后停在 CV~0.31;加大 std 后 20 万步即达 CV~0.18)。
     """
 
     from stable_baselines3 import PPO
@@ -1060,7 +1055,7 @@ def train_ppo(
             )
         model = _make_kl_to_bc_ppo()("MlpPolicy", vec_env, kl_bc_coef=kl_bc_coef, **model_kwargs)
     else:
-        # Vanilla PPO keeps v19-v24 runs bit-comparable (no copied train()).
+        # 原版 PPO,保持 v19-v24 运行逐位可比(不走抄来的 train())。
         model = PPO("MlpPolicy", vec_env, **model_kwargs)
     # 启动自检：打印策略网络里"实际生效"的探索噪声，端到端穿透
     # 配置->args->透传->SB3 整条链（v23 静默失效事故的硬闸）。
@@ -1072,7 +1067,8 @@ def train_ppo(
     )
     if bc_pretrain:
         bc_stats = pretrain_policy_bc(
-            model, make_env, episodes=bc_episodes, epochs=bc_epochs, seed=seed
+            model, make_env, episodes=bc_episodes, epochs=bc_epochs, seed=seed,
+            teacher_fn=bc_teacher_fn,
         )
         print(
             f"BC pretrain: {int(bc_stats['bc_pairs'])} pairs, "
@@ -1082,8 +1078,8 @@ def train_ppo(
             model.set_bc_reference()
             print("self-check: KL-to-BC tether armed (reference = frozen post-BC policy)")
         if after_bc is not None:
-            # Hook for the caller to snapshot/evaluate the pure-BC policy
-            # before PPO fine-tuning touches it (the anchor score).
+            # 留给调用方的钩子:在 PPO 微调触碰之前,对纯 BC 策略
+            # 做快照/评估(即锚点分数)。
             after_bc(model)
     attach_training_logger(
         model,
@@ -1104,7 +1100,7 @@ def train_ppo(
 
 
 def load_ppo(model_path: Path):
-    """Load a saved Stable-Baselines3 PPO model for eval-only experiments."""
+    """加载已保存的 Stable-Baselines3 PPO 模型,用于纯评估类实验。"""
 
     if not model_path.exists():
         raise FileNotFoundError(f"PPO model not found: {model_path}")
@@ -1148,6 +1144,10 @@ def create_run_dir(output_root: Path, task_name: str) -> Path:
 
 def training_config(args: argparse.Namespace):
     overrides = getattr(args, "reward_overrides", None) or {}
+    if str(getattr(args, "env", "2d")) == "3d":
+        from soilbox3d_env import DEFAULT_3D_CONFIG
+
+        return DEFAULT_3D_CONFIG.with_overrides(**overrides)
     return DEFAULT_CONFIG.with_overrides(**overrides)
 
 
@@ -1326,36 +1326,37 @@ def base_defaults() -> dict[str, Any]:
         "clearml_output_uri": "",
         "clearml_online": False,
         "clearml_no_artifacts": False,
-        # Behavior-cloning warm start (v16): imitate the proportional
-        # controller before PPO fine-tuning. Off by default.
+        # 行为克隆热启动(v16):PPO 微调前先模仿比例控制器。默认关闭。
         "bc_pretrain": False,
         "bc_episodes": 300,
         "bc_epochs": 20,
-        # Initial exploration noise, in NORMALIZED action units since v21
-        # ([-1, 1] action space): sigma = e^log_std_init of the half-range.
+        # 初始探索噪声,自 v21 起以归一化动作单位计([-1, 1] 动作空间):
+        # sigma = e^log_std_init,按半量程计。
         "log_std_init": 0.0,
-        # v25 anti-erosion tether: loss += kl_bc_coef * KL(pi || frozen post-BC
-        # policy). 0 = off (vanilla PPO, keeps v19-v24 semantics).
+        # v25 抗侵蚀系绳:loss += kl_bc_coef * KL(pi || 冻结的 BC 后策略)。
+        # 0 = 关闭(原版 PPO,保持 v19-v24 语义)。
         "kl_bc_coef": 0.0,
-        # v25 harvest: every N steps exam the policy on a 20-scenario battery
-        # subset and keep the best snapshot. 0 = off.
+        # v25 收割:每 N 步用 20 场景的考卷子集小测策略并保留最优快照。
+        # 0 = 关闭。
         "checkpoint_every": 0,
-        # v27 adaptive curriculum (from-scratch PPO): reshape the initial-field
-        # dice from easy to hard; advance when rolling end-of-episode success
-        # over `curriculum_window` episodes clears `curriculum_threshold`.
-        # min_contrast is the easy-end contrast floor — calibrated with
-        # `reward_audit.py --curriculum-audit` so proportional > idle holds at
-        # EVERY difficulty (the diffusion-solves-easy-fields trap).
+        # v27 自适应课程(从零 PPO):把初始场骰子从易到难重塑;当
+        # `curriculum_window` 个回合内的滚动回合末成功率清过
+        # `curriculum_threshold` 时提升难度。min_contrast 是易端对比度
+        # 下限 —— 用 `reward_audit.py --curriculum-audit` 标定,保证每个
+        # 难度上"比例控制器 > idle"都成立(防"扩散替易场解题"陷阱)。
         "curriculum": False,
         "curriculum_threshold": 0.8,
         "curriculum_window": 200,
         "curriculum_step": 0.1,
         "curriculum_min_contrast": 0.6,
-        # v28 exploration-noise annealing: once the curriculum reaches d=1.0
-        # (or from step 0 without curriculum), cap log_std on a linear descent
-        # to `log_std_anneal_to` over `log_std_anneal_steps` steps. 0 = off.
+        # v28 探索噪声退火:课程达到 d=1.0 后(无课程则从第 0 步起),
+        # 对 log_std 施加线性下降的上限,经 `log_std_anneal_steps` 步降到
+        # `log_std_anneal_to`。0 = 关闭。
         "log_std_anneal_to": -2.7,
         "log_std_anneal_steps": 0,
+        # 环境类型:"2d"(旧版 3x3 均匀场土箱)或 "3d"(真实几何 4x2x2,
+        # 带电位场求解器,v30+)。
+        "env": "2d",
     }
 
 
@@ -1416,6 +1417,7 @@ def run_named_experiment(
 def print_run_header(args: argparse.Namespace, cfg) -> None:
     print("SoilGuard PPO experiment")
     print(f"Experiment: {args.experiment}")
+    print(f"Environment: {getattr(args, 'env', '2d')}")
     print(f"Config: {cfg}")
     print(f"Parallel envs: {args.n_envs}")
     print(
@@ -1466,28 +1468,54 @@ def print_run_header(args: argparse.Namespace, cfg) -> None:
 
 
 def run_train_standard(args: argparse.Namespace, cfg, task, tensorboard_log: Path | None) -> None:
-    # BC anchor: battery score of the pure-BC policy BEFORE PPO fine-tuning.
-    # The fine-tuned model must not score below this — that is the "PPO ground
-    # the warm start back into idling" alarm.
+    # BC 锚点:PPO 微调之前纯 BC 策略的考卷分数。微调后的模型不得低于
+    # 此分 —— 低于即是"PPO 把热启动磨回不作为"的警报。
     bc_anchor_battery: dict[str, Any] = {}
 
+    # ---- 环境类型:"2d"(旧版 3x3)或 "3d"(真实几何 4x2x2,带电位场
+    # 求解器)。在这一处统一选定环境类、冻结考卷、基线策略和 BC 教师。
+    env_kind = str(getattr(args, "env", "2d"))
+    if env_kind == "3d":
+        from evaluation3d import SCENARIOS_3D, VARIANTS_PER_FAMILY_3D, evaluate_v3d
+        from evaluation3d import idle_policy_3d as _idle3d
+        from soilbox3d_env import SoilBox3DEnv, proportional_policy_3d, rule_policy_3d
+
+        if bool(getattr(args, "curriculum", False)):
+            raise ValueError("curriculum learning is not implemented for the 3D env yet.")
+        if args.randomize_physics or args.randomize_obs_noise:
+            raise ValueError("physics/obs-noise domain randomization is not implemented for the 3D env yet.")
+        eval_fn = evaluate_v3d
+        subset_indices = tuple(range(0, len(SCENARIOS_3D), VARIANTS_PER_FAMILY_3D))
+        idle_fn = _idle3d
+        rule_fn = lambda obs: rule_policy_3d(obs, cfg)
+        teacher_fn = proportional_policy_3d
+
+        def make_base_env(env_seed: int):
+            return SoilBox3DEnv(cfg, seed=env_seed, randomize_initial=args.randomize_initial_field)
+    else:
+        eval_fn = evaluate_v2
+        subset_indices = None          # 检查点回调自行推导 2D 默认子集
+        idle_fn = idle_policy
+        rule_fn = lambda obs: rule_policy(obs, cfg.n_cells, max_electrode_voltage(cfg))
+        teacher_fn = None              # pretrain_policy_bc 默认用 2D 教师
+        make_base_env = None           # 2D 沿用下方参数更全的旧版环境工厂
+
     def evaluate_bc_anchor(model) -> None:
-        anchor = evaluate_v2(ppo_policy_of(model), config=cfg, seed0=args.seed + 1000)
+        anchor = eval_fn(ppo_policy_of(model), config=cfg, seed0=args.seed + 1000)
         print("== ppo_bc_anchor (pure BC, before PPO fine-tune) ==")
         print(format_battery_table(anchor))
         report_metrics(task, "ppo_bc_anchor", anchor["aggregate"], iteration=0)
         bc_anchor_battery.update(anchor)
-        # The anchor has been the strongest policy of the project so far
-        # (v19-v24) — keep it as a loadable artifact, not just a score.
+        # 锚点是本项目迄今(v19-v24)最强的策略 —— 除分数外也把它
+        # 存成可加载的模型文件。
         anchor_path = args.run_dir / "soilguard_ppo_bc_anchor.zip"
         model.save(anchor_path)
         print(f"saved: {anchor_path}")
         if not args.clearml_no_artifacts:
             report_model(task, anchor_path, "soilguard_ppo_bc_anchor")
 
-    # Randomization switches affect TRAINING envs only; the evaluation battery
-    # below always runs on the nominal environment with injected frozen
-    # scenarios, so scores stay comparable across experiments.
+    # 随机化开关只影响训练环境;下方的评估考卷始终在标称环境上注入
+    # 冻结场景运行,保证分数跨实验可比。
     bc_on = bool(getattr(args, "bc_pretrain", False))
     curriculum_on = bool(getattr(args, "curriculum", False))
     if curriculum_on and not args.randomize_initial_field:
@@ -1498,6 +1526,8 @@ def run_train_standard(args: argparse.Namespace, cfg, task, tensorboard_log: Pat
         seed0=args.seed + 1000,
         every_steps=int(getattr(args, "checkpoint_every", 0)),
         task=task,
+        eval_fn=eval_fn,
+        subset_indices=subset_indices,
     )
     curriculum_cb = None
     if curriculum_on:
@@ -1516,7 +1546,9 @@ def run_train_standard(args: argparse.Namespace, cfg, task, tensorboard_log: Pat
     extra_callbacks = [cb for cb in (checkpoint_cb, curriculum_cb, anneal_cb) if cb is not None]
     curriculum_min_contrast = float(getattr(args, "curriculum_min_contrast", 0.6))
     standard_model = train_ppo(
-        lambda env_seed: SoilBoxEnv(
+        make_base_env
+        if make_base_env is not None
+        else (lambda env_seed: SoilBoxEnv(
             config=cfg,
             seed=env_seed,
             randomize=args.randomize_physics,
@@ -1524,7 +1556,7 @@ def run_train_standard(args: argparse.Namespace, cfg, task, tensorboard_log: Pat
             randomize_initial=args.randomize_initial_field,
             curriculum_difficulty=0.0 if curriculum_on else None,
             curriculum_min_contrast=curriculum_min_contrast,
-        ),
+        )),
         args.steps,
         n_envs=args.n_envs,
         seed=args.seed,
@@ -1538,21 +1570,18 @@ def run_train_standard(args: argparse.Namespace, cfg, task, tensorboard_log: Pat
         bc_pretrain=bc_on,
         bc_episodes=int(getattr(args, "bc_episodes", 300)),
         bc_epochs=int(getattr(args, "bc_epochs", 20)),
+        bc_teacher_fn=teacher_fn,
         after_bc=evaluate_bc_anchor if bc_on else None,
         extra_callbacks=extra_callbacks or None,
     )
     standard_path = args.run_dir / "soilguard_ppo_standard.zip"
     standard_model.save(standard_path)
 
-    # Protocol v2: fixed scenario battery, full-horizon rollouts, graded
-    # scoring, with idle (diffusion floor) and rule baselines on the same exam.
-    standard_result = evaluate_v2(ppo_policy_of(standard_model), config=cfg, seed0=args.seed + 1000)
-    idle_result = evaluate_v2(idle_policy, config=cfg, seed0=args.seed + 1000)
-    rule_result = evaluate_v2(
-        lambda obs: rule_policy(obs, cfg.n_cells, max_electrode_voltage(cfg)),
-        config=cfg,
-        seed0=args.seed + 1000,
-    )
+    # 固定冻结考卷、全时程回放、分级计分,并让 idle(扩散地板)与 rule
+    # 基线考同一份卷子。
+    standard_result = eval_fn(ppo_policy_of(standard_model), config=cfg, seed0=args.seed + 1000)
+    idle_result = eval_fn(idle_fn, config=cfg, seed0=args.seed + 1000)
+    rule_result = eval_fn(rule_fn, config=cfg, seed0=args.seed + 1000)
     print("== ppo_standard ==")
     print(format_battery_table(standard_result))
     print("== baseline: idle (diffusion only) ==")
@@ -1567,13 +1596,13 @@ def run_train_standard(args: argparse.Namespace, cfg, task, tensorboard_log: Pat
     if not args.clearml_no_artifacts:
         report_model(task, standard_path, "soilguard_ppo_standard")
 
-    # Harvest: the best in-training checkpoint (by battery subset) retakes the
-    # FULL frozen battery, so its official score lands next to final/anchor.
+    # 收割:训练中(按考卷子集)最优的检查点重考完整冻结考卷,
+    # 使其官方分数与最终模型/锚点并排落账。
     best_battery = None
     best_checkpoint_info = None
     if checkpoint_cb is not None and checkpoint_cb.best_step >= 0:
         best_model = load_ppo(checkpoint_cb.model_path)
-        best_battery = evaluate_v2(ppo_policy_of(best_model), config=cfg, seed0=args.seed + 1000)
+        best_battery = eval_fn(ppo_policy_of(best_model), config=cfg, seed0=args.seed + 1000)
         best_checkpoint_info = {
             "step": checkpoint_cb.best_step,
             "subset_score": checkpoint_cb.best_subset_score,
@@ -1588,14 +1617,14 @@ def run_train_standard(args: argparse.Namespace, cfg, task, tensorboard_log: Pat
         if not args.clearml_no_artifacts:
             report_model(task, checkpoint_cb.model_path, "soilguard_ppo_best")
 
-    # Optional noise evaluation: the trained model retakes the battery with
-    # observation noise at each requested level (sensor-robustness probe).
+    # 可选噪声评估:训练好的模型在每个指定的观测噪声水平下重考考卷
+    # (传感器鲁棒性探针)。
     noise_levels = [
         float(part) for part in str(args.eval_noise_levels or "").split(",") if part.strip()
     ]
     noise_evaluation = {}
     for level in noise_levels:
-        noise_result = evaluate_v2(
+        noise_result = eval_fn(
             ppo_policy_of(standard_model), config=cfg, obs_noise=level, seed0=args.seed + 1000
         )
         print(f"== ppo_standard @ obs_noise={level:g} ==")

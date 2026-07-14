@@ -1,25 +1,20 @@
 # -*- coding: utf-8 -*-
-"""Scenario-battery evaluation (protocol v2) for the SoilGuard soil box.
+"""SoilGuard 土箱的场景考卷评估(协议 v2)。
 
-Replaces the old single-scenario, terminate-on-success report protocol:
+取代旧的"单场景、成功即终止"报告协议:
 
-- **Fixed scenario battery**: a versioned, numbered list of initial moisture
-  fields. Rotated variants expose memorisation (a policy that truly
-  uniformises must handle left-wet and right-wet alike); amplitude variants
-  and fixed-seed random fields probe generalisation. The battery is frozen so
-  every model version takes the same exam.
-- **Full-horizon rollouts**: evaluation ignores the env's terminate-on-success
-  flag and always runs ``max_steps``, so we can measure whether uniformity is
-  held after the target is reached and what the side effects of the whole
-  trajectory are.
-- **Graded scoring**: reaching the target is a weighted component of the
-  scenario score, not a multiplicative gate — a near-miss (CV 0.19) now scores
-  higher than a far miss (CV 0.29) instead of both collapsing to 0.
-- **Baseline anchoring**: callers are expected to also run ``idle_policy``
-  (diffusion only, the floor) and ``rule_policy`` on the same battery.
+- **冻结场景考卷**:一份带版本号、按序编号的初始湿度场清单。旋转变体用来
+  暴露死记硬背(真正会均匀化的策略应当左湿、右湿一视同仁);幅值变体和
+  固定种子的随机场检验泛化能力。考卷冻结不变,每个模型版本考同一份卷子。
+- **全时程回放**:评估忽略环境的"达标即终止"标志,始终跑满 ``max_steps``,
+  以便测量达标后能否守住均匀,以及整条轨迹的副作用。
+- **分级计分**:达标只是场景分数中的一个加权分量,不再是乘法闸门 ——
+  险些达标(CV 0.19)现在会比差得远(CV 0.29)得分更高,而不是双双归零。
+- **基线锚定**:调用方应在同一份考卷上同时跑 ``idle_policy``(纯扩散,
+  地板线)和 ``rule_policy``。
 
-Aggregates are reported as mean +/- std over scenarios plus the worst
-scenario, which is the honest engineering number ("how bad does it get").
+汇总指标按场景均值 +/- 标准差报告,并附最差场景 —— 后者才是诚实的
+工程数字("最坏能坏到什么程度")。
 """
 
 from __future__ import annotations
@@ -38,18 +33,15 @@ from soilbox_env import (
 
 BATTERY_VERSION = "v5.0"
 
-# v5.0: per-step integrated scoring. Every step is graded q_t = 0.60*U +
-# 0.20*P + 0.20*E via the env's piecewise-linear level curves (see
-# SoilBoxConfig), and the scenario score is 100 * mean(q_t) over the horizon.
-# The training reward pays the same q_t in per-step instalments, so training
-# return == exam score by construction. (v4.0 briefly used final-state-only
-# three-axis scoring; v3.0 had the 0.40 reached-gate + local_dry axis — both
-# superseded. ``reached``/hold_frac/dry are reported-only since v4.0.)
+# v5.0:逐步积分计分。每一步按 q_t = 0.60*U + 0.20*P + 0.20*E 打分(用环境
+# 内的分段线性水平曲线,见 SoilBoxConfig),场景分 = 100 * 全时程 mean(q_t)。
+# 训练奖励按步分期支付同一个 q_t,因此"训练回报 == 考卷分数"是构造上成立的。
+# (v4.0 曾短暂使用只看终态的三轴计分;v3.0 有 0.40 达标闸门 + local_dry 轴
+# —— 均已废弃。``reached``/hold_frac/dry 自 v4.0 起仅报告、不计分。)
 
-# Exposure normalisation lines (engineering choices, to be recalibrated
-# against real-box data): exposure = per-step mean violation over the episode.
-# Peaks are reported alongside but not scored — the old peak-based zero-lines
-# proved structurally unreachable for this task (see v6-v9 analysis).
+# 暴露量归一化基准线(工程取值,待用真实土箱数据重新标定):exposure =
+# 整个回合的逐步平均违规量。峰值一并报告但不计分 —— 旧的按峰值定零分线
+# 被证明对本任务结构性不可达(见 v6-v9 分析)。
 PH_EXPOSURE_BAD = 1.0
 DRY_EXPOSURE_BAD = 0.08
 
@@ -91,7 +83,7 @@ def _half_wet(axis: str, wet: float) -> Callable[[SoilBoxConfig], np.ndarray]:
         grid = _base(cfg)
         if axis == "left":
             grid[:, :2] = wet
-        else:  # "top"
+        else:  # 即 axis == "top"
             grid[:2, :] = wet
         return grid
 
@@ -116,19 +108,18 @@ def _gradient(axis: str) -> Callable[[SoilBoxConfig], np.ndarray]:
     return build
 
 
-# 20 distribution families. Each family is a deterministic base pattern; the
-# battery instantiates 5 perturbed variants per family (small +/- noise on the
-# baseline, fixed seeds), giving a frozen 100-scenario exam.
+# 20 个分布族。每族是一个确定性的基准图样;考卷对每族实例化 5 个扰动变体
+# (在基准上加固定种子的 +/- 小噪声),构成一份冻结的 100 场景考卷。
 FAMILIES: list[tuple[str, Callable[[SoilBoxConfig], np.ndarray]]] = [
-    ("left_col", _column_wet(0, 0.35)),          # canonical training scenario
-    ("right_col", _column_wet(2, 0.35)),         # mirror: memorisation check
-    ("back_row", _row_wet(0, 0.35)),             # 90-degree rotations
+    ("left_col", _column_wet(0, 0.35)),          # 训练标准场景
+    ("right_col", _column_wet(2, 0.35)),         # 镜像:查死记硬背
+    ("back_row", _row_wet(0, 0.35)),             # 90 度旋转
     ("front_row", _row_wet(2, 0.35)),
-    ("middle_col", _column_wet(1, 0.35)),        # interior wet: fill-outward
+    ("middle_col", _column_wet(1, 0.35)),        # 内部湿:需向外摊平
     ("middle_row", _row_wet(1, 0.35)),
-    ("left_col_low", _column_wet(0, 0.30)),      # amplitude variants
+    ("left_col_low", _column_wet(0, 0.30)),      # 幅值变体
     ("left_col_high", _column_wet(0, 0.40)),
-    ("corner_tl", _cells([(0, 0)], 0.40)),       # single wet cell topologies
+    ("corner_tl", _cells([(0, 0)], 0.40)),       # 单个湿格的各种拓扑
     ("corner_br", _cells([(2, 2)], 0.40)),
     ("center_cell", _cells([(1, 1)], 0.40)),
     ("diag_main", _cells([(0, 0), (1, 1), (2, 2)], 0.35)),
@@ -138,13 +129,13 @@ FAMILIES: list[tuple[str, Callable[[SoilBoxConfig], np.ndarray]]] = [
     ("cross_wet", _cells([(1, 1), (0, 1), (1, 0), (1, 2), (2, 1)], 0.30)),
     ("left_half", _half_wet("left", 0.28)),
     ("top_half", _half_wet("top", 0.28)),
-    ("border_ring", _border_ring(0.30)),         # wet ring, dry centre
-    ("gradient_x", _gradient("x")),              # smooth ramp
+    ("border_ring", _border_ring(0.30)),         # 湿环、干中心
+    ("gradient_x", _gradient("x")),              # 平滑坡度
 ]
 
 VARIANTS_PER_FAMILY = 5
-# Perturbation amplitude for the seeded variants: small +/- noise on the base
-# pattern so each family probes a neighbourhood, not a single point.
+# 种子变体的扰动幅度:在基准图样上加 +/- 小噪声,使每族检验的是一个邻域,
+# 而不是单个点。
 PERTURBATION = 0.02
 
 
@@ -169,14 +160,14 @@ def _build_battery() -> list[tuple[str, Callable[[SoilBoxConfig], np.ndarray]]]:
     return scenarios
 
 
-# The frozen battery (20 families x 5 seeded variants = 100 scenarios).
-# Do not reorder or edit entries in place — add families / bump
-# BATTERY_VERSION so scores stay comparable across model versions.
+# 冻结考卷(20 族 x 5 个种子变体 = 100 个场景)。
+# 不要就地重排或改动条目 —— 新增分布族时同步升级 BATTERY_VERSION,
+# 保证分数跨模型版本可比。
 SCENARIOS: list[tuple[str, Callable[[SoilBoxConfig], np.ndarray]]] = _build_battery()
 
 
 def idle_policy(obs: np.ndarray) -> np.ndarray:
-    """Do-nothing baseline: diffusion alone sets the floor of the battery."""
+    """什么都不做的基线:仅靠扩散给出考卷的地板分。"""
 
     del obs
     return np.zeros(DEFAULT_CONFIG.total_electrode_count, dtype=np.float32)
@@ -214,8 +205,8 @@ def _rollout_scenario(
 
     for t in range(1, cfg.max_steps + 1):
         action = policy_fn(obs)
-        # Full-horizon protocol: the env may flag terminated on success, but
-        # evaluation keeps stepping to measure stability and total exposure.
+        # 全时程协议:环境可能在达标时置 terminated,但评估继续走步,
+        # 以测量稳定性与总暴露量。
         obs, _, _, _, info = env.step(action)
         terms = info["terms"]
         final_cv = float(info["moisture_cv"])
@@ -227,8 +218,8 @@ def _rollout_scenario(
         dry_peak = max(dry_peak, float(terms["local_dry_violation"]))
         energy += float(terms["energy"])
         power_sum += float(terms["power_phys"])
-        # v5.0: the per-step mini-exam, computed ONCE inside the env and shared
-        # verbatim with the training reward — scoring cannot drift apart.
+        # v5.0:逐步小测验,只在环境内部计算一次,并原样共享给训练奖励 ——
+        # 两边的计分不可能漂移分叉。
         quality_sum += float(terms["step_quality"])
         u_sum += float(terms["u_score"])
         ph_score_sum += float(terms["ph_score"])
@@ -268,20 +259,19 @@ def _rollout_scenario(
 
 
 def score_scenario(metrics: Mapping[str, float]) -> dict[str, float]:
-    """Package the per-scenario score in [0, 100] from rollout metrics.
+    """把回放指标打包成 [0, 100] 的单场景分数(被 3D 考卷 evaluation3d 复用)。
 
-    Battery v5.0: every step is graded q_t = 0.60*U(cv_t) + 0.20*P(viol_t) +
-    0.20*E(power_t) (piecewise-linear level curves, computed inside the env
-    and shared verbatim with the training reward), and the scenario score is
-    simply 100 * mean(q_t) over the full horizon. Consequences:
-      - reaching uniformity EARLY and HOLDING it both pay (time integral) —
-        the v3.0 "time unscored / hold unscored" defects are gone;
-      - the training return (undiscounted, hooks at 0) EQUALS this score by
-        construction — no training-vs-exam alignment gap can exist.
-    ``reached`` and ``dry_score`` remain reported-only monitoring metrics.
+    考卷 v5.0:每一步按 q_t = 0.60*U(cv_t) + 0.20*P(viol_t) + 0.20*E(power_t)
+    打分(分段线性水平曲线,在环境内部计算并原样共享给训练奖励),场景分
+    就是全时程的 100 * mean(q_t)。由此:
+      - 早达标和守得住都有回报(时间积分)—— v3.0 的"时间不计分/保持
+        不计分"缺陷不复存在;
+      - 训练回报(无折扣、钩子为 0)与本分数构造上相等 —— 不可能再出现
+        训练与考卷的对齐缝隙。
+    ``reached`` 与 ``dry_score`` 仍为仅报告的监控指标。
     """
 
-    dry_score = _clip01(1.0 - metrics["dry_exposure"] / DRY_EXPOSURE_BAD)  # reported only
+    dry_score = _clip01(1.0 - metrics["dry_exposure"] / DRY_EXPOSURE_BAD)  # 仅报告、不计分
     return {
         "uniformity_score": float(metrics["uniformity_level_mean"]),
         "ph_score": float(metrics["ph_level_mean"]),
@@ -300,14 +290,12 @@ def evaluate_v2(
     seed0: int = 1000,
     scenario_indices: Sequence[int] | None = None,
 ) -> dict[str, Any]:
-    """Run the frozen scenario battery and return per-scenario + aggregate results.
+    """跑冻结场景考卷,返回逐场景 + 汇总结果(训练管线的 2D 官方考试入口)。
 
-    ``scenario_indices`` selects a battery SUBSET by original scenario index
-    (per-scenario seeds stay ``seed0 + original_index``, so subset metrics are
-    directly comparable with the same scenarios inside a full run). Default
-    None runs the full frozen exam — the official protocol is untouched.
-    Subset runs are for cheap in-training checkpoint ranking only; official
-    scores must come from the full battery.
+    ``scenario_indices`` 按原始场景序号选取考卷的一个子集(每场景种子仍为
+    ``seed0 + 原序号``,故子集指标与完整考卷中相同场景直接可比)。默认
+    None 跑完整冻结考卷 —— 官方协议不受影响。子集运行只供训练中低成本的
+    检查点排名;官方分数必须来自完整考卷。
     """
 
     cfg = _coerce_config(config)
@@ -350,8 +338,8 @@ def evaluate_v2(
 
 
 def format_battery_table(result: Mapping[str, Any]) -> str:
-    """Console table aggregated per family (full per-scenario data stays in
-    the returned dict / diagnostics json)."""
+    """生成按分布族汇总的控制台表格(完整的逐场景数据保留在返回的
+    dict / diagnostics json 里)。"""
 
     families: dict[str, list[Mapping[str, float]]] = {}
     for row in result["per_scenario"]:
